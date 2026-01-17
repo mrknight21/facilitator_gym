@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+pydantic-settings
+motor
+livekit
+livekit-api
+python-dotenv
+pytest
+mongomock
+pytest-asyncio
+httpx
+livekit-agents>=0.8.0
+livekit-plugins-openai>=0.10.0
+livekit-plugins-elevenlabs>=0.10.0
+livekit-plugins-silero>=0.6.0
