@@ -25,9 +25,14 @@ export const ParticipantTile: React.FC<ParticipantTileProps> = ({
     mood = 'neutral',
     className,
 }) => {
+    // Debug
+    // if (isSpeaking) console.log(`[FAC_GYM] Tile ${name} is speaking`);
+
     return (
-        <div className={cn("relative w-full aspect-video bg-gray-800 rounded-lg overflow-hidden shadow-lg border-2 transition-colors duration-300",
-            isSpeaking ? "border-green-500" : "border-transparent",
+        <div className={cn("relative w-full aspect-video bg-gray-800 rounded-lg overflow-hidden shadow-lg transition-all duration-300",
+            isSpeaking
+                ? "ring-4 ring-green-500 shadow-[0_0_20px_rgba(34,197,94,0.6)] scale-[1.02] z-10"
+                : "border-2 border-transparent hover:border-gray-600",
             className
         )}>
             {/* Avatar Image */}

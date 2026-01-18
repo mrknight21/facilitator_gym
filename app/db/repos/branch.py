@@ -1,5 +1,5 @@
 from app.db.repos.base import BaseRepo
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import pymongo
 
 class BranchRepo(BaseRepo):
@@ -13,7 +13,7 @@ class BranchRepo(BaseRepo):
         await self.col.insert_one(branch_data)
         return branch_data
 
-    async def get(self, branch_id: str) -> Dict[str, Any] | None:
+    async def get(self, branch_id: str) -> Optional[Dict[str, Any]]:
         return await self.col.find_one({"_id": branch_id})
 
     async def list_by_session(self, session_id: str) -> List[Dict[str, Any]]:

@@ -1,5 +1,5 @@
 from app.db.repos.base import BaseRepo
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 import pymongo
 
 class MetricsRepo(BaseRepo):
@@ -15,7 +15,7 @@ class MetricsRepo(BaseRepo):
         await self.col.insert_one(doc)
         return doc
 
-    async def get_by_checkpoint(self, session_id: str, branch_id: str, checkpoint_id: str) -> Dict[str, Any] | None:
+    async def get_by_checkpoint(self, session_id: str, branch_id: str, checkpoint_id: str) -> Optional[Dict[str, Any]]:
         return await self.col.find_one({
             "session_id": session_id,
             "branch_id": branch_id,

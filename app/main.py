@@ -1,3 +1,14 @@
+import sys
+import typing
+
+# Python 3.9 Compatibility Patch for libraries using TypeAlias
+if sys.version_info < (3, 10):
+    try:
+        from typing_extensions import TypeAlias
+        typing.TypeAlias = TypeAlias
+    except ImportError:
+        pass
+
 from fastapi import FastAPI
 from app.core.config import settings
 from app.core.logging import setup_logging

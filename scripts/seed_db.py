@@ -1,11 +1,21 @@
 import asyncio
 import os
+import json
+from pathlib import Path
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
+# Load env
+# Try root .env.local first, then frontend/.env.local
+start_path = Path(".")
+env_path = start_path / ".env.local"
+if not env_path.exists():
+    env_path = start_path / "frontend" / ".env.local"
 
-load_dotenv(".env.local")
+print(f"Loading env from: {env_path.absolute()}")
+load_dotenv(env_path)
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+print(f"MONGO_URI: {MONGO_URI}")
 DB_NAME = os.getenv("MONGO_DB", "sim")
 
 async def seed():
@@ -13,22 +23,40 @@ async def seed():
     client = AsyncIOMotorClient(MONGO_URI)
     db = client[DB_NAME]
     
-    # Case Study Data
-    cs_payload = {
-        "_id": "cs_e2e",
-        "case_study_id": "cs_e2e", # Duplicate for consistency with schema if needed, but repo handles _id
-        "title": "Difficult Conversation: The Project Delay",
-        "description": "A high-stakes meeting where three team members discuss a significant delay in the project timeline. Tensions are high as they blame each other for the setbacks.",
-        "participants": ["Alice (Project Manager)", "Bob (Lead Dev)", "Charlie (QA Lead)"],
-        "seed_utterances": [
-            {"seed_idx": 1, "speaker": "alice", "text": "Hello everyone, we need to talk about the timeline."},
-            {"seed_idx": 2, "speaker": "bob", "text": "I know what you're going to say, Alice. It's not my fault."},
-            {"seed_idx": 3, "speaker": "charlie", "text": "Let's just focus on solutions, please."}
-        ]
-    }
+    # 1. Base Dir
+    base_dir = Path("case_studies")
+    if not base_dir.exists():
+        print(f"No case_studies dir found at {base_dir.absolute()}")
+        return
+
+    # 2. Iterate
+    for cs_dir in base_dir.iterdir():
+        if not cs_dir.is_dir(): continue
+        
+        meta_path = cs_dir / "metadata.json"
+        if not meta_path.exists(): continue
+        
+        with open(meta_path, "r") as f:
+            cs = json.load(f)
+            
+        print(f"Processing {cs['id']}...")
+        
+        # 3. Inject Audio Paths
+        audio_dir = cs_dir / "audio"
+        for seed in cs.get("seed_utterances", []):
+            speaker = seed["speaker"].lower()
+            fname = f"seed_{seed['seed_idx']}_{speaker}.mp3"
+            fpath = audio_dir / fname
+            if fpath.exists():
+                seed["audio_url"] = str(fpath.absolute())
+                print(f"  Found audio for seed {seed['seed_idx']}: {fpath.name}")
+            else:
+                print(f"  No audio for seed {seed['seed_idx']}")
+
+        # 4. Upsert
+        print("  Inserting case study...")
+        await db.case_studies.replace_one({"_id": cs["id"]}, cs, upsert=True)
     
-    print("Inserting case study...")
-    await db.case_studies.replace_one({"_id": "cs_e2e"}, cs_payload, upsert=True)
     print("Done!")
 
 if __name__ == "__main__":

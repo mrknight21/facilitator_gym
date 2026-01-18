@@ -1,5 +1,5 @@
 from app.db.repos.base import BaseRepo
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import pymongo
 
 class CheckpointRepo(BaseRepo):
@@ -15,7 +15,7 @@ class CheckpointRepo(BaseRepo):
         await self.col.insert_one(doc)
         return doc
 
-    async def get_by_utterance(self, session_id: str, branch_id: str, utterance_id: str) -> Dict[str, Any] | None:
+    async def get_by_utterance(self, session_id: str, branch_id: str, utterance_id: str) -> Optional[Dict[str, Any]]:
         return await self.col.find_one({
             "session_id": session_id,
             "branch_id": branch_id,

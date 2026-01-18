@@ -1,5 +1,5 @@
 from app.db.repos.base import BaseRepo
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 class SessionRepo(BaseRepo):
     def __init__(self):
@@ -10,7 +10,7 @@ class SessionRepo(BaseRepo):
         await self.col.insert_one(session_data)
         return session_data
 
-    async def get(self, session_id: str) -> Dict[str, Any] | None:
+    async def get(self, session_id: str) -> Optional[Dict[str, Any]]:
         return await self.col.find_one({"_id": session_id})
 
     async def update(self, session_id: str, update_dict: Dict[str, Any]) -> None:

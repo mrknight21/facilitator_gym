@@ -69,7 +69,7 @@ class SessionManager:
                 "text": seed.text,
                 "seed_idx": seed.seed_idx,
                 "timing": {"t_start_ms": 0, "t_end_ms": 0},
-                "audio": {},
+                "audio": {"url": seed.audio_url} if seed.audio_url else {},
                 "meta": {},
                 "created_at": now_iso
             }

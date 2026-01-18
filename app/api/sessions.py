@@ -1,3 +1,4 @@
+import asyncio
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from app.domain.schemas import SessionStartReq, SessionStartRes
 from app.domain.services.session_manager import SessionManager
@@ -54,7 +55,7 @@ async def stop_session(session_id: str):
     return {"status": "stopped"}
 
 from app.livekit.conductor import Conductor
-from app.livekit.agent_worker import AgentWorker
+from app.livekit.speaker_worker import SpeakerWorker
 from app.core.config import settings
 from app.domain.services.conductor_writer import ConductorWriter
 from app.metrics.engine import MetricsEngine
@@ -65,7 +66,6 @@ from app.db.repos.utterance import UtteranceRepo
 from app.db.repos.checkpoint import CheckpointRepo
 from app.db.repos.metrics import MetricsRepo
 from app.livekit.tokens import create_token, VideoGrants
-import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
@@ -95,12 +95,18 @@ async def spawn_simulation(session_id: str, branch_id: str, room_name: str):
         "conductor-bot", 
         VideoGrants(room_join=True, room_admin=True, room=room_name)
     )
+    # Conductor will auto-transition to PLAYING_SEED on connect
     await conductor.connect(settings.LIVEKIT_URL, token, session_id, branch_id)
     
-    # 3. Connect Agents (Hardcoded for now based on prototype)
+    # 3. Connect Agents (Dumb Speakers)
     agents = []
+    voice_map = {
+        "alice": {"voice": "nova"},
+        "bob": {"voice": "onyx"}, 
+        "charlie": {"voice": "echo"}
+    }
     for name in ["alice", "bob", "charlie"]:
-        agent = AgentWorker(name, "helpful")
+        agent = SpeakerWorker(name, voice_map.get(name, {}))
         agent_token = create_token(
             settings.LIVEKIT_API_KEY, 
             settings.LIVEKIT_API_SECRET, 
@@ -111,8 +117,8 @@ async def spawn_simulation(session_id: str, branch_id: str, room_name: str):
         await agent.connect(settings.LIVEKIT_URL, agent_token)
         agents.append(agent)
 
-    # 4. Start Seed Playback
-    await conductor.start_seed_playback()
+    # 4. (Removed) Start Seed Playback - handled by Conductor State Machine
+
 
     # Keep alive (simple loop for prototype)
     try:

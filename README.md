@@ -111,10 +111,13 @@ The facilitator's dashboard, built with Next.js (App Router).
 
 ## Prerequisites
 
-- **Python 3.10+**
+- **Python 3.10+** (Strictly required due to `TypeAlias` and `|` union syntax in dependencies)
 - **Node.js 18+**
 - **MongoDB**
 - **LiveKit Server**
+- **ffmpeg** (Required for audio playback)
+  - Mac: `brew install ffmpeg`
+  - Linux: `sudo apt-get install ffmpeg`
 
 ## Setup
 

@@ -1,6 +1,6 @@
 import uuid
 import time
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from app.db.repos.branch import BranchRepo
 from app.db.repos.session import SessionRepo
 from app.domain.schemas import ForkRes, BranchOut
@@ -11,7 +11,7 @@ class VersionControl:
         self.session_repo = session_repo
 
     async def fork_branch(self, session_id: str, parent_branch_id: str, 
-                          from_utterance_id: str | None, from_checkpoint_id: str | None, 
+                          from_utterance_id: Optional[str], from_checkpoint_id: Optional[str], 
                           created_by: str) -> ForkRes:
         # Verify parent branch exists
         parent = await self.branch_repo.get(parent_branch_id)

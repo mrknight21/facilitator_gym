@@ -1,5 +1,5 @@
 from app.db.repos.base import BaseRepo
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import pymongo
 
 class UtteranceRepo(BaseRepo):
@@ -24,7 +24,7 @@ class UtteranceRepo(BaseRepo):
         await self.col.insert_one(doc)
         return doc
 
-    async def get(self, utterance_id: str) -> Dict[str, Any] | None:
+    async def get(self, utterance_id: str) -> Optional[Dict[str, Any]]:
         return await self.col.find_one({"_id": utterance_id})
 
     async def get_by_branch(self, session_id: str, branch_id: str) -> List[Dict[str, Any]]:

@@ -1,4 +1,4 @@
-const API_BASE = "http://localhost:8000";
+const API_BASE = "/api";
 
 export const api = {
     async startSession(caseStudyId: string, createdBy: string) {
@@ -48,7 +48,7 @@ export const api = {
         if (!res.ok) throw new Error("Failed to intervene");
         return res.json();
     },
-    
+
     async getTranscript(sessionId: string, branchId: string) {
         const res = await fetch(`${API_BASE}/sessions/${sessionId}/branches/${branchId}/transcript`);
         if (!res.ok) throw new Error("Failed to get transcript");

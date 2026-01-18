@@ -17,6 +17,7 @@ class AudioRef(BaseModel):
     ref: Optional[str] = None
     offset_ms: Optional[int] = None
     duration_ms: Optional[int] = None
+    url: Optional[str] = None # Direct URL/Path to audio file
 
 
 UtteranceKind = Literal["seed", "ai", "user_intervention", "system_silence"]
@@ -31,6 +32,7 @@ class SeedUtteranceIn(BaseModel):
     seed_idx: int = Field(..., ge=1)
     speaker: str
     text: str
+    audio_url: Optional[str] = None
 
 
 class CaseStudyCreate(BaseModel):
@@ -120,7 +122,7 @@ class BranchOut(BaseModel):
     fork_from_utterance_id: Optional[str] = None
     fork_from_checkpoint_id: Optional[str] = None
     branch_label: str
-    created_at: str | None = None
+    created_at: Optional[str] = None
 
 
 class UtteranceView(BaseModel):

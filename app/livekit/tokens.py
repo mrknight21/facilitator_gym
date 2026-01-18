@@ -13,7 +13,9 @@ def create_token(api_key: str, api_secret: str, room_name: str, identity: str, g
         .with_name(identity)
     return token.to_jwt()
 
-def mint_token(identity: str, room_name: str, can_publish: bool, can_subscribe: bool, can_publish_data: bool, room_config: dict | None = None) -> str:
+from typing import Optional
+
+def mint_token(identity: str, room_name: str, can_publish: bool, can_subscribe: bool, can_publish_data: bool, room_config: Optional[dict] = None) -> str:
     grant = api.VideoGrants(
         room_join=True,
         room=room_name,

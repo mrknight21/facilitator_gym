@@ -1,0 +1,27 @@
+{
+  "id": "cs_e2e",
+  "title": "Difficult Conversation: The Project Delay",
+  "description": "A high-stakes meeting where three team members discuss a significant delay in the project timeline.",
+  "participants": [
+    "Alice (Project Manager)",
+    "Bob (Lead Dev)",
+    "Charlie (QA Lead)"
+  ],
+  "seed_utterances": [
+    {
+      "seed_idx": 1,
+      "speaker": "alice",
+      "text": "Hello everyone, we need to talk about the timeline."
+    },
+    {
+      "seed_idx": 2,
+      "speaker": "bob",
+      "text": "I know what you're going to say, Alice. It's not my fault."
+    },
+    {
+      "seed_idx": 3,
+      "speaker": "charlie",
+      "text": "Let's just focus on solutions, please."
+    }
+  ]
+}

@@ -1,14 +1,39 @@
+import sys
+import typing
+
+# Python 3.9 Compatibility Patch
+if sys.version_info < (3, 10):
+    try:
+        from typing_extensions import TypeAlias
+        typing.TypeAlias = TypeAlias
+    except ImportError:
+        pass
+
 import asyncio
 import json
 import logging
 import time
 from livekit import rtc
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
+from enum import Enum
+
 from app.domain.services.conductor_writer import ConductorWriter
 from app.metrics.engine import MetricsEngine
 from app.domain.services.transcript_resolver import TranscriptResolver
+from app.livekit.protocol import AgentPacket, MsgType, SpeakCmdPayload
+from app.domain.services.llm_service import LLMService
+
+import io
+import wave
+from app.domain.services.stt_service import STTService
 
 logger = logging.getLogger(__name__)
+
+class ConductorState(str, Enum):
+    INIT = "INIT"
+    PLAYING_SEED = "PLAYING_SEED"
+    LIVE = "LIVE"
+    ENDING = "ENDING"
 
 class Conductor:
     def __init__(self, writer: ConductorWriter, metrics_engine: MetricsEngine, resolver: TranscriptResolver):
@@ -16,192 +41,448 @@ class Conductor:
         self.metrics_engine = metrics_engine
         self.resolver = resolver
         self.room = rtc.Room()
-        self.bid_queue: List[Dict] = []
-        self.current_speaker: Optional[str] = None
+        
+        self.state = ConductorState.INIT
         self.session_id: Optional[str] = None
         self.branch_id: Optional[str] = None
-        self.is_playing_seeds = False
+        
+        self.current_speaker: Optional[str] = None
         self.seed_task = None
         
+        # Synchronization
+        self.live_loop_signal = asyncio.Event()
+        self.playback_done_event = asyncio.Event()
+
+        # Telemetry
+        self.live_loop_signal: Optional[asyncio.Event] = None
+        
+        # PTT / STT State
+        self.stt_service = STTService()
+        self.is_recording_facilitator = False
+        self.is_processing_intervention = False
+        self.audio_capture_buffer = bytearray()
+        self.intervention_stats = {}
+        self.stt_streams = {} 
+        self.last_sample_rate = 48000 # Default
+        
+        # Event handlers
         self.room.on("data_received", self.on_data_received)
         self.room.on("participant_disconnected", self.on_participant_disconnected)
         self.room.on("track_subscribed", self.on_track_subscribed)
-
-        # STT Setup
-        from app.livekit.stt import get_stt_plugin
-        self.stt = get_stt_plugin()
-        self.stt_streams = {} # identity -> task
 
     async def connect(self, url: str, token: str, session_id: str, branch_id: str):
         self.session_id = session_id
         self.branch_id = branch_id
         await self.room.connect(url, token)
         logger.info(f"Conductor connected to room {self.room.name}")
+        
+        # Initial transition
+        await self.transition_to(ConductorState.PLAYING_SEED)
 
     async def disconnect(self):
+        await self.transition_to(ConductorState.ENDING)
         await self.room.disconnect()
-        await self.stop_seed_playback()
-        # Cancel all STT tasks
-        for task in self.stt_streams.values():
-            task.cancel()
 
-    def on_data_received(self, data: bytes, participant: rtc.RemoteParticipant, kind: rtc.DataPacketKind):
+    async def transition_to(self, new_state: ConductorState):
+        logger.info(f"State transition: {self.state} -> {new_state} [Session: {self.session_id}]")
+        self.state = new_state
+        
+        if new_state == ConductorState.PLAYING_SEED:
+            self.seed_task = asyncio.create_task(self._run_seed_playback())
+        elif new_state == ConductorState.LIVE:
+            self.seed_task = asyncio.create_task(self._run_live_loop())
+        elif new_state == ConductorState.ENDING:
+            if self.seed_task:
+                self.seed_task.cancel()
+            # Cleanup STT
+            for t in self.stt_streams.values(): t.cancel()
+
+    # -------------------------------------------------------------------------
+    # Message Handling (Task 0.2)
+    # -------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Message Handling (Task 0.2)
+    # -------------------------------------------------------------------------
+    def on_data_received(self, event):
         try:
-            msg = json.loads(data.decode("utf-8"))
-            msg_type = msg.get("type")
+            # Extract fields from event object
+            data = event.data
+            participant = event.participant
+            kind = event.kind
+
+            # Decode using protocol
+            payload_str = data.decode("utf-8")
+            raw_msg = json.loads(payload_str)
             
-            if msg_type == "bid":
-                # Intervention stops seeds
-                if self.is_playing_seeds:
-                    asyncio.create_task(self.stop_seed_playback())
-                self.handle_bid(participant.identity, msg)
-            elif msg_type == "done":
-                asyncio.create_task(self.handle_done(participant.identity))
-                
+            # Validation
+            try:
+                packet = AgentPacket(**raw_msg)
+            except Exception as e:
+                logger.warning(f"Invalid message format from {participant.identity}: {e}")
+                return
+
+            self._handle_packet(packet, participant.identity)
+
         except Exception as e:
             logger.error(f"Error handling data: {e}")
 
-    def on_participant_disconnected(self, participant: rtc.RemoteParticipant):
-        self.bid_queue = [b for b in self.bid_queue if b["identity"] != participant.identity]
-        if self.current_speaker == participant.identity:
-            self.current_speaker = None
-            self.process_queue()
+    def _handle_packet(self, packet: AgentPacket, sender_id: str):
+        logger.info(f"Received {packet.type} from {sender_id}: {packet.payload}")
         
-        # Cleanup STT
+        if packet.type == MsgType.FAC_START:
+            # Start PTT
+            self.is_recording_facilitator = True
+            self.is_processing_intervention = True
+            self.audio_capture_buffer.clear()
+            asyncio.create_task(self._process_intervention(sender_id))
+            
+        elif packet.type == MsgType.FAC_END:
+            # Stop PTT & Finalize
+            logger.info(f"Facilitator {sender_id} released PTT.")
+            self.is_recording_facilitator = False
+            asyncio.create_task(self._finalize_recording(sender_id))
+            
+        elif packet.type == MsgType.PLAYBACK_DONE:
+            self.playback_done_event.set()
+            # Relay to frontend for UI update
+            asyncio.create_task(self.broadcast_playback_done(sender_id))
+            if self.live_loop_signal:
+                self.live_loop_signal.set()
+        elif packet.type == MsgType.FINISH:
+            logger.info("Received FINISH command from facilitator.")
+            asyncio.create_task(self.transition_to(ConductorState.ENDING))
+
+    async def _process_intervention(self, sender_id: str):
+        self.intervention_stats = {'t_fac_start': time.time(), 'sender': sender_id}
+        logger.info(f"Facilitator intervention started by {sender_id}")
+        
+        if self.state == ConductorState.PLAYING_SEED:
+            if self.seed_task:
+                self.seed_task.cancel()
+            await self.transition_to(ConductorState.LIVE)
+        
+        # Stop current speaker
+        if self.current_speaker:
+            await self.send_stop_cmd(self.current_speaker)
+            # If we are in LIVE loop, we need to interrupt the wait?
+            if self.live_loop_signal:
+                self.live_loop_signal.set() # Force loop to wake up and re-evaluate
+        
+        self.intervention_stats['t_audio_stopped'] = time.time()
+
+    # -------------------------------------------------------------------------
+    # Seed Playback (Epic 1)
+    # -------------------------------------------------------------------------
+    async def _run_seed_playback(self):
+        try:
+            logger.info("Starting seed playback...")
+            view = await self.resolver.get_transcript_view(self.session_id, self.branch_id)
+            seeds = [u for u in view.utterances if u.kind == "seed"]
+            
+            for seed in seeds:
+                if self.state != ConductorState.PLAYING_SEED: break
+                
+                self.current_speaker = seed.speaker_id
+                logger.info(f"Playing seed: {seed.text} (Speaker: {seed.speaker_id})")
+                
+                # Clear event before sending command
+                self.playback_done_event.clear()
+                
+                # Send SPEAK command to the dumb agent (Task 2.1)
+                audio_url = seed.audio.url if seed.audio and seed.audio.url else None
+                await self.send_speak_cmd(seed.speaker_id, seed.text, audio_url)
+                
+                # Wait for PLAYBACK_DONE (with 10s timeout fallback)
+                try:
+                    await asyncio.wait_for(self.playback_done_event.wait(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout waiting for playback_done from {seed.speaker_id}")
+                
+                await asyncio.sleep(0.5) # Inter-turn pause
+                
+            logger.info("Seed playback complete.")
+            await self.transition_to(ConductorState.LIVE)
+            
+        except asyncio.CancelledError:
+            logger.info("Seed playback cancelled (intervention?)")
+        except Exception as e:
+            logger.error(f"Seed playback error: {e}")
+            await self.transition_to(ConductorState.LIVE)
+
+    # -------------------------------------------------------------------------
+    # Live Loop (Epic 3)
+    # -------------------------------------------------------------------------
+    async def _run_live_loop(self):
+        logger.info("Starting LIVE loop...")
+        
+        # Init LLM
+        # Init LLM
+        llm = LLMService()
+        
+        # Personas (Hardcoded for MVP)
+        personas = {
+            "alice": "You are Alice, a supportive but cautious team member. You often agree but raise risk concerns.",
+            "bob": "You are Bob, an aggressive and action-oriented leader. You hate wasting time.",
+            "charlie": "You are Charlie, a detail-oriented analyst. You love data but can get bogged down."
+        }
+        active_speakers = list(personas.keys())
+        
+        while self.state == ConductorState.LIVE:
+            try:
+                # Wait if processing intervention
+                while self.is_processing_intervention:
+                    await asyncio.sleep(0.1)
+
+                # 1. Fetch Context
+                view = await self.resolver.get_transcript_view(self.session_id, self.branch_id)
+                # Convert utterances to "Speaker: Text" strings
+                history = [f"{u.speaker_id}: {u.text}" for u in view.utterances]
+                
+                # 2. Decide Speaker
+                decision = await llm.decide_speaker(history, personas, active_speakers)
+                speaker_id = decision.get("speaker_id")
+                reason = decision.get("reason")
+                logger.info(f"LLM Decision: {speaker_id} ({reason})")
+                
+                if speaker_id == "silence":
+                    # Broadcast Silence
+                    logger.info("Loop: Silence chosen. Broadcasting silence_start...")
+                    await self.broadcast_silence()
+                    
+                    # Wait for a while or until intervention
+                    await asyncio.sleep(4.0) 
+                    continue
+
+                if speaker_id not in active_speakers:
+                     logger.warning(f"LLM chose invalid speaker {speaker_id}. Skipping.")
+                     await asyncio.sleep(1.0)
+                     continue
+
+                # 3. Generate Text
+                persona = personas.get(speaker_id, "")
+                text = await llm.generate_turn_text(speaker_id, persona, history)
+                
+                # 4. Speak
+                self.current_speaker = speaker_id
+                self.live_loop_signal = asyncio.Event()
+                
+                await self.send_speak_cmd(speaker_id, text)
+                
+                # 5. Wait for Done (with timeout)
+                try:
+                    await asyncio.wait_for(self.live_loop_signal.wait(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Turn timed out.")
+                
+                self.current_speaker = None
+                self.live_loop_signal = None
+                
+                # 6. Commit Turn (Task 3.3)
+                # In MVP, the speaker simply speaks. Ideally we commit *after* they are done.
+                # However, our data model uses "AI" utterances.
+                # We should commit it here or have the SpeakerWorker send a "committed" msg.
+                # For Conductor-driven, we commit here.
+                await self._commit_ai_turn(speaker_id, text)
+
+                # 7. Check Objectives
+                if await self._check_objectives(history + [f"{speaker_id}: {text}"]):
+                    logger.info("Objectives met! Ending session.")
+                    # Broadcast finish? 
+                    # For now just end locally.
+                    # await self.broadcast_finish()
+                    break
+
+                await asyncio.sleep(0.5) # Inter-turn delay
+                
+            except asyncio.CancelledError:
+                logger.info("Live loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Live loop error: {e}")
+                await asyncio.sleep(2.0)
+
+    async def _commit_ai_turn(self, identity: str, text: str):
+        if not self.writer: return
+        event_id = f"urn-ai-{int(time.time()*1000)}"
+        timing = {"t_start_ms": 0, "t_end_ms": 1000} # Stub
+        
+        await self.writer.append_utterance_and_checkpoint(
+            self.session_id, 
+            self.branch_id, 
+            "ai", 
+            identity, 
+            text, 
+            timing, 
+            {}, 
+            event_id
+        )
+
+    async def _check_objectives(self, history: List[str]) -> bool:
+        """
+        Check if any session objectives are met or if we should end.
+        Simple heuristic for MVP.
+        """
+        # Example: Keyword trigger
+        if history and "wrap up" in history[-1].lower():
+            return True
+        return False
+
+    # -------------------------------------------------------------------------
+    # Commands
+    # -------------------------------------------------------------------------
+    async def send_speak_cmd(self, participant_id: str, text: str, audio_url: Optional[str] = None):
+        cmd = AgentPacket(
+            type=MsgType.SPEAK_CMD,
+            session_id=self.session_id,
+            payload=SpeakCmdPayload(
+                text=text, 
+                speaker_id=participant_id,
+                audio_url=audio_url
+            ).model_dump()
+        )
+        msg_str = cmd.model_dump_json()
+        
+        # Broadcast to all so frontend sees it too
+        logger.info(f"Broadcasting SPEAK_CMD for {participant_id}")
+        await self.room.local_participant.publish_data(
+            msg_str.encode("utf-8"), 
+            reliable=True, 
+            destination_identities=[] # Broadcast
+        )
+
+    async def send_stop_cmd(self, participant_id: str):
+        cmd = AgentPacket(
+            type=MsgType.STOP_CMD,
+            session_id=self.session_id
+        )
+        await self.room.local_participant.publish_data(
+            cmd.model_dump_json().encode("utf-8"),
+            reliable=True,
+            destination_identities=[] # Broadcast
+        )
+
+    async def broadcast_playback_done(self, speaker_id: str):
+        logger.info(f"Broadcasting PLAYBACK_DONE for {speaker_id}")
+        # Notify room that speaking ended
+        msg = AgentPacket(
+            type=MsgType.PLAYBACK_DONE,
+            session_id=self.session_id,
+            payload={"speaker_id": speaker_id}
+        )
+        await self.room.local_participant.publish_data(
+            msg.model_dump_json().encode("utf-8"),
+            reliable=True,
+            destination_identities=[]
+        )
+
+    async def broadcast_silence(self):
+        msg = AgentPacket(
+            type="silence_start", # Custom type for frontend
+            session_id=self.session_id
+        )
+        await self.room.local_participant.publish_data(
+            msg.model_dump_json().encode("utf-8"),
+            reliable=True
+        )
+
+    # -------------------------------------------------------------------------
+    # Standard STT / Connection handling
+    # -------------------------------------------------------------------------
+    def on_participant_disconnected(self, participant: rtc.RemoteParticipant):
         if participant.identity in self.stt_streams:
             self.stt_streams[participant.identity].cancel()
             del self.stt_streams[participant.identity]
 
     def on_track_subscribed(self, track: rtc.RemoteTrack, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant):
-        if track.kind == rtc.TrackKind.KIND_AUDIO and participant.identity not in ["alice", "bob", "charlie", "conductor-bot"]:
-            logger.info(f"Subscribed to audio from {participant.identity}, starting STT")
-            task = asyncio.create_task(self._handle_speech(participant, track))
-            self.stt_streams[participant.identity] = task
+        logger.info(f"DEBUG: Track subscribed: {participant.identity} kind={track.kind}")
+        if track.kind == rtc.TrackKind.KIND_AUDIO:
+             # Heuristic: if it's not a bot, it's a human (facilitator)
+             if participant.identity not in ["alice", "bob", "charlie", "conductor-bot"]:
+                logger.info(f"Subscribed to audio track for {participant.identity}")
+                self.stt_streams[participant.identity] = asyncio.create_task(
+                    self._handle_audio_stream(participant, track)
+                )
 
-    async def _handle_speech(self, participant: rtc.RemoteParticipant, track: rtc.RemoteAudioTrack):
+    async def _handle_audio_stream(self, participant: rtc.RemoteParticipant, track: rtc.RemoteAudioTrack):
         audio_stream = rtc.AudioStream(track)
-        stt_stream = self.stt.stream()
+        logger.info(f"Started reading audio stream for {participant.identity}")
         
-        async def push_audio():
-            async for frame in audio_stream:
-                stt_stream.push_frame(frame)
-            stt_stream.end_input()
+        async for frame in audio_stream:
+            # PTT Logic: Only buffer if recording flag is active
+            if self.is_recording_facilitator:
+                self.audio_capture_buffer.extend(frame.data)
+                self.last_sample_rate = frame.sample_rate
 
-        async def read_transcripts():
-            from livekit.agents import stt
-            async for event in stt_stream:
-                if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
-                    text = event.alternatives[0].text
-                    if text:
-                        logger.info(f"STT from {participant.identity}: {text}")
-                        await self.handle_intervention(participant.identity, text)
-
-        try:
-            await asyncio.gather(push_audio(), read_transcripts())
-        except Exception as e:
-            logger.error(f"STT Error for {participant.identity}: {e}")
-
-    async def handle_intervention(self, identity: str, text: str):
-        logger.info(f"Intervention detected from {identity}: {text}")
+    async def _commit_user_turn(self, identity: str, text: str):
+        if not self.writer: return
         
-        # 1. Stop everything
-        if self.is_playing_seeds:
-            await self.stop_seed_playback()
-        
-        # 2. Revoke floor from current speaker (if any)
-        # For now, we just rely on them stopping naturally or we could send a "stop" message
-        # But let's just log it for now as the "Intervention" logic in F006 was mostly client-side API.
-        # Here we are doing it server-side.
-        
-        # TODO: Call the actual intervention logic (forking, etc)
-        # This would duplicate what the /intervene API does.
-        # Ideally, we refactor the logic from the API into a service method we can call here.
-        pass
-
-    def handle_bid(self, identity: str, msg: Dict):
-        logger.info(f"Received bid from {identity}: {msg}")
-        self.bid_queue.append({"identity": identity, "msg": msg})
-        self.process_queue()
-
-    async def handle_done(self, identity: str):
-        logger.info(f"Received done from {identity}")
-        if self.current_speaker == identity:
-            await self.capture_turn(identity)
-            self.current_speaker = None
-            self.process_queue()
-
-    async def capture_turn(self, identity: str):
-        if not self.session_id or not self.branch_id:
-            logger.error("Missing session context")
-            return
-
-        text = "Stub text from speech"
-        timing = {"t_start_ms": 0, "t_end_ms": 1000}
-        state = {}
-        event_id = f"turn-{identity}-{int(time.time())}"
+        timing = {"t_start_ms": 0, "t_end_ms": 1000} # Stub timing
+        event_id = f"urn-{int(time.time()*1000)}"
         
         try:
-            res = await self.writer.append_utterance_and_checkpoint(
-                self.session_id, self.branch_id, "ai", identity, text, timing, state, event_id
+            logger.info(f"Committing facilitator turn: {text}")
+            await self.writer.append_utterance_and_checkpoint(
+                self.session_id, 
+                self.branch_id, 
+                "user_intervention", 
+                identity, 
+                text, 
+                timing, 
+                {}, 
+                event_id
             )
-            
-            await self.metrics_engine.compute_for_checkpoint(
-                self.session_id, self.branch_id, res["checkpoint_id"]
-            )
-            logger.info(f"Captured turn for {identity}")
-            
         except Exception as e:
-            logger.error(f"Failed to capture turn: {e}")
-
-    def process_queue(self):
-        if self.current_speaker:
-            return
-        
-        if not self.bid_queue:
-            return
+            logger.error(f"Failed to commit user turn: {e}")
             
-        next_bid = self.bid_queue.pop(0)
-        identity = next_bid["identity"]
+    async def _finalize_recording(self, sender_id: str):
+        self.intervention_stats['t_fac_end'] = time.time()
         
-        self.grant_floor(identity)
+        if not self.audio_capture_buffer:
+            logger.warning("No audio captured in PTT segment.")
+            self.is_processing_intervention = False
+            return
 
-    def grant_floor(self, identity: str):
-        logger.info(f"Granting floor to {identity}")
-        self.current_speaker = identity
-        
-        msg = json.dumps({"type": "grant_floor", "identity": identity})
-        asyncio.create_task(self.room.local_participant.publish_data(msg.encode("utf-8"), reliable=True))
-
-    async def start_seed_playback(self):
-        self.is_playing_seeds = True
-        self.seed_task = asyncio.create_task(self._play_seeds_loop())
-
-    async def stop_seed_playback(self):
-        self.is_playing_seeds = False
-        if self.seed_task:
-            self.seed_task.cancel()
-            try:
-                await self.seed_task
-            except asyncio.CancelledError:
-                pass
-
-    async def _play_seeds_loop(self):
         try:
-            view = await self.resolver.get_transcript_view(self.session_id, self.branch_id)
-            seeds = [u for u in view.utterances if u.kind == "seed"]
+            # 1. Prepare WAV
+            # Assuming 24kHz mono (LiveKit default often varies, but usually 48k or 24k. 
+            # We should ideally check frame info, but assuming 24000/1 for MVP based on SpeakerWorker)
+            buffer_bytes = bytes(self.audio_capture_buffer)
             
-            for seed in seeds:
-                if not self.is_playing_seeds:
-                    break
-                
-                logger.info(f"Playing seed {seed.display_id}: {seed.text}")
-                duration = (seed.timing.t_end_ms - seed.timing.t_start_ms) / 1000.0
-                if duration <= 0: duration = 0.1 # Fast for tests
-                
-                await asyncio.sleep(duration)
-                
-            logger.info("Seed playback finished")
+            with io.BytesIO() as wav_io:
+                with wave.open(wav_io, "wb") as wav_file:
+                    wav_file.setnchannels(1)
+                    wav_file.setsampwidth(2) # 16-bit
+                    wav_file.setframerate(self.last_sample_rate) 
+                    # Actually AudioStream defaults to source rate. WebRTC is usually 48k.
+                    # Let's try 48k. If mismatch, OpenAI Whisper is robust to speed changes usually, but pitch will vary.
+                    wav_file.writeframes(buffer_bytes)
+                wav_bytes = wav_io.getvalue()
+
+            # 2. Transcribe
+            self.intervention_stats['t_stt_req'] = time.time()
+            logger.info(f"Transcribing {len(wav_bytes)} bytes...")
+            text = await self.stt_service.transcribe(wav_bytes)
+            self.intervention_stats['t_stt_res'] = time.time()
+
+            # 3. Telemetry Log
+            stats = self.intervention_stats
+            stop_latency = (stats.get('t_audio_stopped', 0) - stats.get('t_fac_start', 0)) * 1000
+            stt_latency = (stats.get('t_stt_res', 0) - stats.get('t_stt_req', 0)) * 1000
+            total_latency = (stats.get('t_stt_res', 0) - stats.get('t_fac_end', 0)) * 1000
+            
+            logger.info(f"Intervention Stats | Stop: {stop_latency:.0f}ms | STT: {stt_latency:.0f}ms | Total Lag: {total_latency:.0f}ms")
+
+            # 4. Commit
+            if text:
+                await self._commit_user_turn(sender_id, text)
+            else:
+                logger.warning("Empty transcript from OpenAI.")
+
         except Exception as e:
-            logger.error(f"Error in seed playback: {e}")
+            logger.error(f"Error finalizing recording: {e}")
         finally:
-            self.is_playing_seeds = False
+            self.audio_capture_buffer.clear()
+            self.is_processing_intervention = False
+            # Resume loop
+            if self.live_loop_signal:
+                self.live_loop_signal.set()
