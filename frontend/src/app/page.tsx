@@ -1,6 +1,7 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
+import { Lobby } from '@/components/Lobby';
 import { ParticipantGrid } from '@/components/ParticipantGrid';
 import { DashboardPanel } from '@/components/DashboardPanel';
 import { ControlBar } from '@/components/ControlBar';
@@ -8,18 +9,21 @@ import { ParticipantTile } from '@/components/ParticipantTile';
 import { api } from '@/lib/api';
 import { useLiveKit } from '@/hooks/useLiveKit';
 import { RoomEvent } from 'livekit-client';
-
-// Mock avatars for now
+// ...
 const AVATARS: Record<string, string> = {
     "alice": "/avatars/sarah.png",
     "bob": "/avatars/mike.png",
-    "charlie": "/avatars/jessica.png"
+    "charlie": "/avatars/jessica.png",
+    "david": "/avatars/david.png",
 };
 
 export default function Home() {
     const [sessionId, setSessionId] = useState<string | null>(null);
     const [token, setToken] = useState<string | null>(null);
     const [isStarting, setIsStarting] = useState(false);
+
+    // UI States
+    const [isBusy, setIsBusy] = useState(false);
 
     // LiveKit Hook
     const { room, participants, isConnected } = useLiveKit(
@@ -88,11 +92,29 @@ export default function Home() {
                     const spk = msg.payload?.speaker_id || msg.speaker_id; // Support both just in case
                     console.log(`[FAC_GYM] SET SPEAKING: ${spk}`);
                     if (spk) setSpeakingState(prev => ({ ...prev, [spk]: true }));
+                } else if (msg.type === 'fac_ack') {
+                    // Watchdog Clear
+                    console.log("Received PTT ACK");
+                    if (pttTimeoutRef.current) {
+                        clearTimeout(pttTimeoutRef.current);
+                        pttTimeoutRef.current = null;
+                    }
+                } else if (msg.type === 'mic_seen') {
+                    // Server confirms mic audio
+                    console.log("[FAC_GYM] Server confirmed MIC_SEEN");
+                    setServerReady(true);
                 } else if (msg.type === 'playback_done') {
                     // Stop speaking visual
                     const spk = msg.payload?.speaker_id || msg.speaker_id;
                     console.log(`[FAC_GYM] CLEAR SPEAKING: ${spk}`);
                     if (spk) setSpeakingState(prev => ({ ...prev, [spk]: false }));
+                } else if (msg.type === 'transcript_complete') {
+                    // Show what the system heard
+                    const text = msg.payload?.text || "";
+                    console.log(`[FAC_GYM] TRANSCRIPT: ${text}`);
+                    // Quick UI feedback (can be improved later)
+                    // alert(`System Heard: ${text}`); // Too intrusive?
+                    // Let's just log it loudly for now, maybe add a transient state if we had a toast component.
                 }
             } catch (e) { console.error(e); }
         };
@@ -113,12 +135,28 @@ export default function Home() {
         }));
 
     // Audio Persistence: Enable mic on join but keep muted
+    // NEW: Handle Local Mic Permission (Lobby)
+    const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+    const [serverReady, setServerReady] = useState(false);
+
+    const grantMicAccess = async () => {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            setLocalStream(stream);
+            setIsAudioEnabled(true);
+        } catch (e) {
+            console.error("Mic permission denied:", e);
+            alert("Microphone access is required.");
+        }
+    };
+
     useEffect(() => {
         if (!room) return;
         const initMic = async () => {
             console.log("[FAC_GYM] Initializing Microphone...");
             try {
                 // Enable mic (publishes track)
+                // Since we already granted permission in Lobby, this should be seamless
                 await room.localParticipant.setMicrophoneEnabled(true);
                 // Immediately mute so we don't broadcast yet
                 room.localParticipant.audioTrackPublications.forEach(p => {
@@ -133,9 +171,15 @@ export default function Home() {
         initMic();
     }, [room]);
 
+    // Watchdog State
+    const pttTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
     const startPtt = async () => {
         if (!room || !sessionId || isPttPressed.current) return;
         isPttPressed.current = true;
+        // Don't set Visual Mic ON yet? Or set it but wait for ACK to confirm?
+        // Current UX: User expects instant feedback.
+        // Let's set it, but if no ACK in 1s, we kill it.
         setIsMicOn(true);
 
         try {
@@ -146,14 +190,35 @@ export default function Home() {
             if (trackPub?.track) {
                 trackPub.track.unmute();
             } else {
-                // Fallback if track missing
                 await room.localParticipant.setMicrophoneEnabled(true);
             }
 
-            // 2. Send Start Signal
+            // 2. Mute Remote Audio (Instant Interruption)
+            room.remoteParticipants.forEach((p) => {
+                p.audioTrackPublications.forEach((t) => {
+                    // t.track?.detach(); // DO NOT DETACH
+                    if (t.track && t.kind === 'audio') {
+                        // Cast to any because setVolume might not be in the strict type depending on version
+                        (t.track as any).setVolume(0);
+                    }
+                });
+            });
+
+            // 3. Send Start Signal
             const encode = (msg: any) => new TextEncoder().encode(JSON.stringify(msg));
             const msg = { type: "fac_start", session_id: sessionId };
             await room.localParticipant.publishData(encode(msg), { reliable: true });
+
+            // 4. Start Watchdog (Reliability Task 3.2)
+            if (pttTimeoutRef.current) clearTimeout(pttTimeoutRef.current);
+            pttTimeoutRef.current = setTimeout(() => {
+                if (isPttPressed.current) {
+                    console.error("PTT ACK Timeout! Potentially lost packet.");
+                    endPtt();
+                    alert("Audio Start Failed: Server didn't acknowledge. Please try again.");
+                }
+            }, 1500); // 1.5s tolerance
+
         } catch (e) {
             console.error("Failed to start PTT:", e);
         }
@@ -172,6 +237,15 @@ export default function Home() {
             if (trackPub?.track) {
                 trackPub.track.mute();
             }
+
+            // 2. Restore Remote Audio
+            room.remoteParticipants.forEach(p => {
+                p.audioTrackPublications.forEach(t => {
+                    if (t.track && t.kind === 'audio') {
+                        (t.track as any).setVolume(1);
+                    }
+                });
+            });
 
             // 2. Send End Signal
             const encode = (msg: any) => new TextEncoder().encode(JSON.stringify(msg));
@@ -270,30 +344,26 @@ export default function Home() {
                 {/* Right: Details */}
                 <div className="w-2/3 flex flex-col justify-center items-start pl-8">
                     {selectedCS ? (
-                        <div className="max-w-2xl w-full space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
-                            <div>
-                                <h2 className="text-4xl font-bold mb-4">{selectedCS.title}</h2>
-                                <p className="text-xl text-gray-300 leading-relaxed">{selectedCS.description}</p>
+                        <div className="w-full">
+                            {/* Show Details OR Lobby? For now, we wrap the Start flow in Lobby */}
+                            {/* We can show the Lobby, and inside Lobby show the "Start Session" button */}
+                            {/* But Lobby is generic. Let's Pass the metadata or just render Lobby */}
+
+                            <div className="mb-6">
+                                <h2 className="text-4xl font-bold mb-2">{selectedCS.title}</h2>
+                                <p className="text-xl text-gray-300">{selectedCS.description}</p>
                             </div>
 
-                            <div className="bg-gray-900/50 p-6 rounded-xl border border-gray-800">
-                                <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-4">Participants</h3>
-                                <div className="flex flex-wrap gap-3">
-                                    {selectedCS.participants?.map((p: string, i: number) => (
-                                        <span key={i} className="px-3 py-1 bg-gray-800 rounded-full text-sm border border-gray-700">
-                                            {p}
-                                        </span>
-                                    ))}
-                                </div>
-                            </div>
-
-                            <button
-                                onClick={() => handleStart(selectedCS.case_study_id)}
-                                disabled={isStarting}
-                                className="w-full py-4 bg-blue-600 rounded-xl hover:bg-blue-500 disabled:opacity-50 font-bold text-lg transition-all shadow-lg shadow-blue-900/20"
-                            >
-                                {isStarting ? "Initializing Simulation..." : "Start Session"}
-                            </button>
+                            <Lobby
+                                onGrantMic={grantMicAccess}
+                                micPermissionGranted={isAudioEnabled}
+                                serverReady={true}
+                                onStartSession={() => handleStart(selectedCS.case_study_id)}
+                                isBusy={isStarting}
+                                stream={localStream}
+                                intro={selectedCS.description}
+                                participants={selectedCS.participants}
+                            />
                         </div>
                     ) : (
                         <div className="text-gray-500 text-xl">Select a case study to begin</div>
@@ -353,13 +423,12 @@ export default function Home() {
 
             {/* Bottom: Control Bar */}
             <ControlBar
-                isPlaying={isConnected}
-                onTogglePlay={handleEndSession}
                 timer="00:00"
                 isMicOn={isMicOn}
-                onToggleMic={() => { }} // Disabled click toggle
+                onToggleMic={() => { }}
                 onPttDown={startPtt}
                 onPttUp={endPtt}
+                onEndSession={handleEndSession}
             />
         </main>
     );

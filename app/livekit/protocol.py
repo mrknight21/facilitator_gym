@@ -18,6 +18,17 @@ class MsgType(str, Enum):
     FAC_END = "fac_end"     # Push-to-talk end / finish utterance
     FINISH = "finish"       # End session
 
+    # Server -> Client (Verification)
+    MIC_SEEN = "mic_seen"
+    # ACK for PTT Start
+    FAC_ACK = "fac_ack"
+    
+    # Worker -> Conductor (Internal/Broadcast)
+    TRANSCRIPT_COMPLETE = "transcript_complete"
+
+    # Broadcast Silence
+    SILENCE_START = "silence_start"
+
 class AgentPacket(BaseModel):
     """
     Standard envelope for all data messages in the simulation.

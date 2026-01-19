@@ -56,6 +56,7 @@ async def stop_session(session_id: str):
 
 from app.livekit.conductor import Conductor
 from app.livekit.speaker_worker import SpeakerWorker
+from app.transcription.worker import TranscriptionWorker
 from app.core.config import settings
 from app.domain.services.conductor_writer import ConductorWriter
 from app.metrics.engine import MetricsEngine
@@ -96,6 +97,27 @@ async def spawn_simulation(session_id: str, branch_id: str, room_name: str):
         VideoGrants(room_join=True, room_admin=True, room=room_name)
     )
     # Conductor will auto-transition to PLAYING_SEED on connect
+    
+    # 3. Init Workers
+    # Transcription Worker (Dedicated STT)
+    from app.domain.services.stt_service import STTService
+    stt_service = STTService() # Uses OpenAI by default
+    transcription_worker = TranscriptionWorker(stt_service)
+    
+    # Connect Conductor & Workers
+    # We need to run them concurrently.
+    # The Conductor's run loop is the main "keep alive".
+    
+    # Start Transcription Worker
+    t_token = create_token(
+        settings.LIVEKIT_API_KEY, 
+        settings.LIVEKIT_API_SECRET, 
+        room_name, 
+        "transcription-worker", 
+        VideoGrants(room_join=True, room=room_name)
+    )
+    await transcription_worker.connect(settings.LIVEKIT_URL, t_token)
+    
     await conductor.connect(settings.LIVEKIT_URL, token, session_id, branch_id)
     
     # 3. Connect Agents (Dumb Speakers)
@@ -126,6 +148,9 @@ async def spawn_simulation(session_id: str, branch_id: str, room_name: str):
             await asyncio.sleep(1)
     except asyncio.CancelledError:
         logger.info("Simulation stopped")
+    finally:
+        logger.info("Cleaning up resources...")
         await conductor.disconnect()
+        await transcription_worker.disconnect()
         for a in agents:
             await a.disconnect()

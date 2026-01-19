@@ -25,7 +25,7 @@ from app.domain.services.llm_service import LLMService
 
 import io
 import wave
-from app.domain.services.stt_service import STTService
+# from app.domain.services.stt_service import STTService
 
 logger = logging.getLogger(__name__)
 
@@ -54,16 +54,16 @@ class Conductor:
         self.playback_done_event = asyncio.Event()
 
         # Telemetry
+        # Telemetry
         self.live_loop_signal: Optional[asyncio.Event] = None
         
         # PTT / STT State
-        self.stt_service = STTService()
         self.is_recording_facilitator = False
         self.is_processing_intervention = False
-        self.audio_capture_buffer = bytearray()
         self.intervention_stats = {}
-        self.stt_streams = {} 
-        self.last_sample_rate = 48000 # Default
+        # Audio handling removed (Worker)
+        
+        # Event handlers
         
         # Event handlers
         self.room.on("data_received", self.on_data_received)
@@ -94,8 +94,7 @@ class Conductor:
         elif new_state == ConductorState.ENDING:
             if self.seed_task:
                 self.seed_task.cancel()
-            # Cleanup STT
-            for t in self.stt_streams.values(): t.cancel()
+            # Cleanup STT (Removed)
 
     # -------------------------------------------------------------------------
     # Message Handling (Task 0.2)
@@ -133,14 +132,24 @@ class Conductor:
             # Start PTT
             self.is_recording_facilitator = True
             self.is_processing_intervention = True
-            self.audio_capture_buffer.clear()
+            try:
+                # Removed: self.audio_capture_buffer.clear() - Worker handles audio
+                pass
+            except Exception: pass
+            
             asyncio.create_task(self._process_intervention(sender_id))
+            
+            # Send ACK (Reliability Task 3.1)
+            asyncio.create_task(self._send_fac_ack(sender_id))
             
         elif packet.type == MsgType.FAC_END:
             # Stop PTT & Finalize
             logger.info(f"Facilitator {sender_id} released PTT.")
             self.is_recording_facilitator = False
-            asyncio.create_task(self._finalize_recording(sender_id))
+            # Wait for TRANSCRIPT_COMPLETE
+            
+        elif packet.type == MsgType.TRANSCRIPT_COMPLETE:
+            self._handle_transcript_complete(packet.payload)
             
         elif packet.type == MsgType.PLAYBACK_DONE:
             self.playback_done_event.set()
@@ -386,12 +395,10 @@ class Conductor:
         )
 
     # -------------------------------------------------------------------------
-    # Standard STT / Connection handling
+    # Connection handling
     # -------------------------------------------------------------------------
     def on_participant_disconnected(self, participant: rtc.RemoteParticipant):
-        if participant.identity in self.stt_streams:
-            self.stt_streams[participant.identity].cancel()
-            del self.stt_streams[participant.identity]
+        pass
 
     def on_track_subscribed(self, track: rtc.RemoteTrack, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant):
         logger.info(f"DEBUG: Track subscribed: {participant.identity} kind={track.kind}")
@@ -399,20 +406,55 @@ class Conductor:
              # Heuristic: if it's not a bot, it's a human (facilitator)
              if participant.identity not in ["alice", "bob", "charlie", "conductor-bot"]:
                 logger.info(f"Subscribed to audio track for {participant.identity}")
-                self.stt_streams[participant.identity] = asyncio.create_task(
-                    self._handle_audio_stream(participant, track)
-                )
+                
+                # Task 1.4: Send Server Confirmation (Mic Seen)
+                asyncio.create_task(self._send_mic_seen(participant.identity))
+                # Note: Legacy STT Logic removed. Worker handles transcription.
 
-    async def _handle_audio_stream(self, participant: rtc.RemoteParticipant, track: rtc.RemoteAudioTrack):
-        audio_stream = rtc.AudioStream(track)
-        logger.info(f"Started reading audio stream for {participant.identity}")
+    async def _send_mic_seen(self, participant_id: str):
+        msg = AgentPacket(
+            type=MsgType.MIC_SEEN,
+            session_id=self.session_id,
+            payload={"participant_id": participant_id}
+        )
+        try:
+             await self.room.local_participant.publish_data(
+                msg.model_dump_json().encode("utf-8"),
+                reliable=True,
+                destination_identities=[participant_id]
+            )
+        except Exception as e:
+            logger.error(f"Failed to send MIC_SEEN: {e}")
+
+    # -------------------------------------------------------------------------
+    # Transcription Handling (Epic 2)
+    # -------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Transcription Handling (Epic 2)
+    # -------------------------------------------------------------------------
+    def _handle_transcript_complete(self, payload: dict):
+        # Triggered by MsgType.TRANSCRIPT_COMPLETE from Worker
+        asyncio.create_task(self._process_transcript_and_resume(payload))
         
-        async for frame in audio_stream:
-            # PTT Logic: Only buffer if recording flag is active
-            if self.is_recording_facilitator:
-                self.audio_capture_buffer.extend(frame.data)
-                self.last_sample_rate = frame.sample_rate
+    async def _process_transcript_and_resume(self, payload: dict):
+        text = payload.get("text", "")
+        speaker_id = payload.get("speaker_id", "user")
+        
+        logger.info(f"Conductor handling transcript from {speaker_id}: {text}")
+        
+        if not text: 
+            # Even if empty, we should resume the loop
+            self.is_processing_intervention = False
+            return
 
+        # 1. Commit to DB (Wait for it!)
+        # Crucial: We must wait for this to complete so the next fetch sees it.
+        await self._commit_user_turn(speaker_id, text)
+        
+        # 2. Notify Live Loop to proceed
+        logger.info("Facilitator intervention complete. Resuming live loop.")
+        self.is_processing_intervention = False
+            
     async def _commit_user_turn(self, identity: str, text: str):
         if not self.writer: return
         
@@ -434,55 +476,19 @@ class Conductor:
         except Exception as e:
             logger.error(f"Failed to commit user turn: {e}")
             
-    async def _finalize_recording(self, sender_id: str):
-        self.intervention_stats['t_fac_end'] = time.time()
-        
-        if not self.audio_capture_buffer:
-            logger.warning("No audio captured in PTT segment.")
-            self.is_processing_intervention = False
-            return
-
+    async def _send_fac_ack(self, participant_id: str):
+        msg = AgentPacket(
+            type=MsgType.FAC_ACK,
+            session_id=self.session_id,
+            payload={"participant_id": participant_id} 
+        )
         try:
-            # 1. Prepare WAV
-            # Assuming 24kHz mono (LiveKit default often varies, but usually 48k or 24k. 
-            # We should ideally check frame info, but assuming 24000/1 for MVP based on SpeakerWorker)
-            buffer_bytes = bytes(self.audio_capture_buffer)
-            
-            with io.BytesIO() as wav_io:
-                with wave.open(wav_io, "wb") as wav_file:
-                    wav_file.setnchannels(1)
-                    wav_file.setsampwidth(2) # 16-bit
-                    wav_file.setframerate(self.last_sample_rate) 
-                    # Actually AudioStream defaults to source rate. WebRTC is usually 48k.
-                    # Let's try 48k. If mismatch, OpenAI Whisper is robust to speed changes usually, but pitch will vary.
-                    wav_file.writeframes(buffer_bytes)
-                wav_bytes = wav_io.getvalue()
-
-            # 2. Transcribe
-            self.intervention_stats['t_stt_req'] = time.time()
-            logger.info(f"Transcribing {len(wav_bytes)} bytes...")
-            text = await self.stt_service.transcribe(wav_bytes)
-            self.intervention_stats['t_stt_res'] = time.time()
-
-            # 3. Telemetry Log
-            stats = self.intervention_stats
-            stop_latency = (stats.get('t_audio_stopped', 0) - stats.get('t_fac_start', 0)) * 1000
-            stt_latency = (stats.get('t_stt_res', 0) - stats.get('t_stt_req', 0)) * 1000
-            total_latency = (stats.get('t_stt_res', 0) - stats.get('t_fac_end', 0)) * 1000
-            
-            logger.info(f"Intervention Stats | Stop: {stop_latency:.0f}ms | STT: {stt_latency:.0f}ms | Total Lag: {total_latency:.0f}ms")
-
-            # 4. Commit
-            if text:
-                await self._commit_user_turn(sender_id, text)
-            else:
-                logger.warning("Empty transcript from OpenAI.")
-
+             await self.room.local_participant.publish_data(
+                msg.model_dump_json().encode("utf-8"),
+                reliable=True,
+                destination_identities=[participant_id] # Targeted ACK
+            )
         except Exception as e:
-            logger.error(f"Error finalizing recording: {e}")
-        finally:
-            self.audio_capture_buffer.clear()
-            self.is_processing_intervention = False
-            # Resume loop
-            if self.live_loop_signal:
-                self.live_loop_signal.set()
+            logger.error(f"Failed to send FAC_ACK: {e}")
+
+    # _finalize_recording removed (Logic moved to Worker)
