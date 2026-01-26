@@ -46,6 +46,7 @@ class SpeakerWorker:
 
         self.speak_task: Optional[asyncio.Task] = None
         self.session_id: Optional[str] = None
+        self.current_turn_id: Optional[str] = None
 
     async def connect(self, url: str, token: str):
         await self.room.connect(url, token)
@@ -78,6 +79,7 @@ class SpeakerWorker:
                 cmd = SpeakCmdPayload(**packet.payload)
                 if cmd.speaker_id == self.identity:
                     self.session_id = packet.session_id
+                    self.current_turn_id = packet.turn_id
                     self._handle_speak_cmd(cmd)
             
             elif packet.type == MsgType.STOP_CMD:
@@ -174,6 +176,7 @@ class SpeakerWorker:
         msg = AgentPacket(
             type=MsgType.PLAYBACK_DONE,
             session_id=self.session_id,
+            turn_id=self.current_turn_id,
             payload=payload.model_dump()
         )
         

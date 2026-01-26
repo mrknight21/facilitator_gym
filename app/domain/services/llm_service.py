@@ -88,3 +88,43 @@ class LLMService:
     def _format_history(self, history: List[str]) -> str:
         # History is expected to be a list of "Speaker: Text" strings
         return "\n".join(history[-10:])
+
+    async def plan_next_turn(self, history: List[str], personas: Dict[str, str], active_speakers: List[str]) -> Dict:
+        """
+        Consolidated planning: Decides speaker AND generates text in one go.
+        Returns: {"speaker_id": "...", "text": "...", "reason": "..."}
+        """
+        system_prompt = (
+            "You are a conversation director and roleplayer. "
+            "1. Decide who speaks next based on history/personas (or 'silence'). "
+            "2. If someone speaks, generate their line (natural, concise, 1-2 sentences). "
+            "3. Output JSON: {\"speaker_id\": \"...\", \"text\": \"...\", \"reason\": \"...\"}"
+        )
+        
+        user_content = f"""
+        Active Speakers: {', '.join(active_speakers)}
+        
+        Personas:
+        {json.dumps(personas, indent=2)}
+        
+        Recent History:
+        {self._format_history(history)}
+        
+        Plan the next turn.
+        """
+        
+        try:
+            response = await self.client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.7
+            )
+            content = response.choices[0].message.content
+            return json.loads(content)
+        except Exception as e:
+            logger.error(f"LLM Planning Error: {e}")
+            return {"speaker_id": "silence", "reason": "Error fallback", "text": ""}

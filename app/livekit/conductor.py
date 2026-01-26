@@ -21,7 +21,9 @@ from app.domain.services.conductor_writer import ConductorWriter
 from app.metrics.engine import MetricsEngine
 from app.domain.services.transcript_resolver import TranscriptResolver
 from app.livekit.protocol import AgentPacket, MsgType, SpeakCmdPayload
+from app.livekit.protocol import AgentPacket, MsgType, SpeakCmdPayload
 from app.domain.services.llm_service import LLMService
+from app.livekit.speculative import SpecPlanner, SpecPlan
 
 import io
 import wave
@@ -47,7 +49,17 @@ class Conductor:
         self.branch_id: Optional[str] = None
         
         self.current_speaker: Optional[str] = None
+        self.current_turn_id: Optional[str] = None
         self.seed_task = None
+        
+        # Runtime State (Ticket 2)
+        self.history_cache: List[str] = []
+        self.state_version: int = 0
+        
+        # Speculative Planning (Ticket 3/4)
+        self.spec_planner: Optional[SpecPlanner] = None
+        self.spec_plan: Optional[SpecPlan] = None
+        self.spec_plan_task: Optional[asyncio.Task] = None
         
         # Synchronization
         self.live_loop_signal = asyncio.Event()
@@ -56,6 +68,7 @@ class Conductor:
         # Telemetry
         # Telemetry
         self.live_loop_signal: Optional[asyncio.Event] = None
+        self.t_playback_done: float = 0.0
         
         # PTT / STT State
         self.is_recording_facilitator = False
@@ -94,6 +107,8 @@ class Conductor:
         elif new_state == ConductorState.ENDING:
             if self.seed_task:
                 self.seed_task.cancel()
+            if self.spec_plan_task:
+                self.spec_plan_task.cancel()
             # Cleanup STT (Removed)
 
     # -------------------------------------------------------------------------
@@ -139,6 +154,12 @@ class Conductor:
             
             asyncio.create_task(self._process_intervention(sender_id))
             
+            # Cancel Speculation (Ticket 5)
+            if self.spec_plan_task:
+                self.spec_plan_task.cancel()
+            self.spec_plan = None
+            self.state_version += 1
+            
             # Send ACK (Reliability Task 3.1)
             asyncio.create_task(self._send_fac_ack(sender_id))
             
@@ -152,7 +173,15 @@ class Conductor:
             self._handle_transcript_complete(packet.payload)
             
         elif packet.type == MsgType.PLAYBACK_DONE:
+            # Validate turn_id
+            if packet.turn_id and packet.turn_id != self.current_turn_id:
+                logger.warning(f"Received stale/mismatched PLAYBACK_DONE: {packet.turn_id} != {self.current_turn_id}")
+                return
+
             self.playback_done_event.set()
+            # Telemetry: Log gap start
+            self.t_playback_done = time.time()
+            
             # Relay to frontend for UI update
             asyncio.create_task(self.broadcast_playback_done(sender_id))
             if self.live_loop_signal:
@@ -169,6 +198,9 @@ class Conductor:
             if self.seed_task:
                 self.seed_task.cancel()
             await self.transition_to(ConductorState.LIVE)
+        
+        # Invalidate speculation (Ticket 5)
+        self.state_version += 1
         
         # Stop current speaker
         if self.current_speaker:
@@ -199,7 +231,12 @@ class Conductor:
                 
                 # Send SPEAK command to the dumb agent (Task 2.1)
                 audio_url = seed.audio.url if seed.audio and seed.audio.url else None
-                await self.send_speak_cmd(seed.speaker_id, seed.text, audio_url)
+                
+                # Generate turn_id
+                turn_id = f"turn-{int(time.time()*1000)}"
+                self.current_turn_id = turn_id
+                
+                await self.send_speak_cmd(seed.speaker_id, seed.text, audio_url, turn_id)
                 
                 # Wait for PLAYBACK_DONE (with 10s timeout fallback)
                 try:
@@ -227,6 +264,12 @@ class Conductor:
         # Init LLM
         # Init LLM
         llm = LLMService()
+        self.spec_planner = SpecPlanner(llm)
+        
+        # Initialize History Cache (Ticket 2)
+        view = await self.resolver.get_transcript_view(self.session_id, self.branch_id)
+        self.history_cache = [f"{u.speaker_id}: {u.text}" for u in view.utterances]
+        logger.info(f"Initialized history_cache with {len(self.history_cache)} items")
         
         # Personas (Hardcoded for MVP)
         personas = {
@@ -242,20 +285,47 @@ class Conductor:
                 while self.is_processing_intervention:
                     await asyncio.sleep(0.1)
 
-                # 1. Fetch Context
-                view = await self.resolver.get_transcript_view(self.session_id, self.branch_id)
-                # Convert utterances to "Speaker: Text" strings
-                history = [f"{u.speaker_id}: {u.text}" for u in view.utterances]
+                # 1. Fetch Context (Ticket 2: Use Cache)
+                # view = await self.resolver.get_transcript_view(self.session_id, self.branch_id)
+                # history = [f"{u.speaker_id}: {u.text}" for u in view.utterances]
+                history = list(self.history_cache) # Copy to be safe
                 
-                # 2. Decide Speaker
-                decision = await llm.decide_speaker(history, personas, active_speakers)
-                speaker_id = decision.get("speaker_id")
-                reason = decision.get("reason")
-                logger.info(f"LLM Decision: {speaker_id} ({reason})")
+                # 2. Plan Next Turn (Ticket 4: Speculative vs Sync)
+                plan_data = None
+                
+                # Check if we have a valid speculative plan
+                if (self.spec_plan and 
+                    self.spec_plan.after_turn_id == self.current_turn_id and # Wait, current_turn_id is the *previous* turn? No, it's the one that just finished.
+                    # Actually, when PLAYBACK_DONE arrives, current_turn_id is the turn that just finished.
+                    # The spec plan was created *during* that turn, so its after_turn_id should match.
+                    # But wait, current_turn_id is set when we send SPEAK_CMD.
+                    # So when we loop around, current_turn_id is the one that just finished.
+                    # Yes.
+                    self.spec_plan.plan_version == self.state_version and
+                    not self.is_processing_intervention):
+                    
+                    logger.info("Using speculative plan!")
+                    # Telemetry: spec_used = True
+                    plan_data = {
+                        "speaker_id": self.spec_plan.speaker_id,
+                        "text": self.spec_plan.text
+                    }
+                    # Clear it so we don't reuse
+                    self.spec_plan = None
+                else:
+                    logger.info("Fallback to synchronous planning.")
+                    # Telemetry: spec_used = False
+                    plan_data = await llm.plan_next_turn(history, personas, active_speakers)
+                
+                speaker_id = plan_data.get("speaker_id")
+                text = plan_data.get("text")
+                reason = plan_data.get("reason", "Speculative" if not plan_data.get("reason") else plan_data.get("reason"))
+                
+                logger.info(f"Turn Plan: {speaker_id} ({reason})")
                 
                 # RACE CONDITION CHECK 1
                 if self.is_processing_intervention:
-                    logger.info("Intervention detected after decision. Discarding decision.")
+                    logger.info("Intervention detected after planning. Discarding plan.")
                     continue
                 
                 if speaker_id == "silence":
@@ -271,21 +341,39 @@ class Conductor:
                      logger.warning(f"LLM chose invalid speaker {speaker_id}. Skipping.")
                      await asyncio.sleep(1.0)
                      continue
-
-                # 3. Generate Text
-                persona = personas.get(speaker_id, "")
-                text = await llm.generate_turn_text(speaker_id, persona, history)
                 
-                # RACE CONDITION CHECK 2
-                if self.is_processing_intervention:
-                    logger.info("Intervention detected after generation. Discarding text.")
-                    continue
+                # Text is already generated in plan
+                if not text:
+                    text = "..." # Fallback?
                 
                 # 4. Speak
                 self.current_speaker = speaker_id
                 self.live_loop_signal = asyncio.Event()
                 
-                await self.send_speak_cmd(speaker_id, text)
+                # Generate turn_id
+                turn_id = f"turn-{int(time.time()*1000)}"
+                self.current_turn_id = turn_id
+                
+                # Telemetry: Gap Duration
+                if self.t_playback_done > 0:
+                    gap_ms = (time.time() - self.t_playback_done) * 1000
+                    logger.info(f"Gap Duration: {gap_ms:.2f}ms")
+                
+                # Spawn Speculative Planner (Ticket 4)
+                # We want to plan what happens *after* this turn.
+                # So we pass the history + this new turn.
+                # But we can't append to history_cache yet (that happens on commit).
+                # So we construct a temporary history.
+                spec_history = history + [f"{speaker_id}: {text}"]
+                
+                if self.spec_plan_task:
+                    self.spec_plan_task.cancel()
+                
+                self.spec_plan_task = asyncio.create_task(self._run_spec_planner(
+                    spec_history, personas, active_speakers, self.state_version, turn_id
+                ))
+                
+                await self.send_speak_cmd(speaker_id, text, audio_url=None, turn_id=turn_id)
                 
                 # 5. Wait for Done (with timeout)
                 try:
@@ -297,21 +385,19 @@ class Conductor:
                 self.live_loop_signal = None
                 
                 # 6. Commit Turn (Task 3.3)
-                # In MVP, the speaker simply speaks. Ideally we commit *after* they are done.
-                # However, our data model uses "AI" utterances.
-                # We should commit it here or have the SpeakerWorker send a "committed" msg.
-                # For Conductor-driven, we commit here.
+                
+                # Update Cache (Ticket 2)
+                self.history_cache.append(f"{speaker_id}: {text}")
+                
                 await self._commit_ai_turn(speaker_id, text)
 
                 # 7. Check Objectives
                 if await self._check_objectives(history + [f"{speaker_id}: {text}"]):
                     logger.info("Objectives met! Ending session.")
-                    # Broadcast finish? 
-                    # For now just end locally.
-                    # await self.broadcast_finish()
                     break
 
-                await asyncio.sleep(0.5) # Inter-turn delay
+                # Reduced Inter-turn delay (Ticket 4)
+                await asyncio.sleep(0.2) # 200ms natural gap
                 
             except asyncio.CancelledError:
                 logger.info("Live loop cancelled")
@@ -336,6 +422,18 @@ class Conductor:
             event_id
         )
 
+    async def _run_spec_planner(self, history, personas, active_speakers, version, after_turn_id):
+        try:
+            logger.info(f"Starting speculative plan for after {after_turn_id} (v{version})")
+            plan = await self.spec_planner.plan_next(history, personas, active_speakers, version, after_turn_id)
+            if plan:
+                self.spec_plan = plan
+                logger.info(f"Speculative plan ready: {plan.speaker_id}")
+        except asyncio.CancelledError:
+            logger.info("Speculative planning cancelled")
+        except Exception as e:
+            logger.error(f"Speculative planning error: {e}")
+
     async def _check_objectives(self, history: List[str]) -> bool:
         """
         Check if any session objectives are met or if we should end.
@@ -349,10 +447,11 @@ class Conductor:
     # -------------------------------------------------------------------------
     # Commands
     # -------------------------------------------------------------------------
-    async def send_speak_cmd(self, participant_id: str, text: str, audio_url: Optional[str] = None):
+    async def send_speak_cmd(self, participant_id: str, text: str, audio_url: Optional[str] = None, turn_id: Optional[str] = None):
         cmd = AgentPacket(
             type=MsgType.SPEAK_CMD,
             session_id=self.session_id,
+            turn_id=turn_id,
             payload=SpeakCmdPayload(
                 text=text, 
                 speaker_id=participant_id,
@@ -459,6 +558,11 @@ class Conductor:
 
         # 1. Commit to DB (Wait for it!)
         # Crucial: We must wait for this to complete so the next fetch sees it.
+        
+        # Update Cache (Ticket 2)
+        self.history_cache.append(f"{speaker_id}: {text}")
+        self.state_version += 1 # Invalidate any stale plans
+        
         await self._commit_user_turn(speaker_id, text)
         
         # 2. Notify Live Loop to proceed
