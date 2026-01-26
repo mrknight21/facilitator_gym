@@ -6,7 +6,8 @@ A multi-party difficult conversation simulator for training facilitators. This p
 
 - **Backend**: Python (FastAPI) - Manages session state, branching, and AI agents.
 - **Frontend**: TypeScript (Next.js) - Real-time UI for the facilitator using LiveKit.
-- **Real-time Communication**: LiveKit - Handles audio streaming and data messaging between frontend and backend agents.
+- **Real-time Communication**: LiveKit - Handles audio streaming and data messaging.
+- **Workers**: Python (LiveKit Agents) - `Conductor` manages the room state, `SpeakerWorker` handles agent speech, and `TranscriptionWorker` handles STT.
 - **Database**: MongoDB - Stores case studies, session logs, and version control trees.
 
 ## Project Structure
@@ -60,7 +61,8 @@ The core logic of the simulator, built with FastAPI.
 #### `app/livekit/` (Real-time Runtime)
 
 - `conductor.py`: The "Room Manager". Connects to LiveKit, manages the floor (who speaks), handles bids, and captures completed turns to the DB.
-- `agent_worker.py`: Represents an AI participant. Connects to LiveKit, holds a persona, bids for the floor, and simulates speech.
+- `speaker_worker.py`: Represents an AI participant. Connects to LiveKit, holds a persona, bids for the floor, and simulates speech.
+- `protocol.py`: Definitions for data messages exchanged between Conductor, Agents, and Frontend.
 - `tokens.py`: Helper utilities for generating LiveKit JWTs.
 
 #### `app/metrics/` (Analysis)
@@ -115,6 +117,7 @@ The facilitator's dashboard, built with Next.js (App Router).
 - **Node.js 18+**
 - **MongoDB**
 - **LiveKit Server**
+- **LiveKit Agents & Plugins** (Installed via requirements.txt)
 - **ffmpeg** (Required for audio playback)
   - Mac: `brew install ffmpeg`
   - Linux: `sudo apt-get install ffmpeg`
@@ -193,5 +196,5 @@ PYTHONPATH=. pytest tests/test_e2e.py
 
 1.  **Start Session**: Click "Start Session" on the frontend. This calls the backend to initialize a new session and create a root branch.
 2.  **LiveKit Connection**: The frontend connects to the LiveKit room.
-3.  **Simulation**: AI agents (simulated by the backend) will join the room.
-4.  **Intervention**: Speak into the microphone to intervene. The system will capture your speech, fork the conversation state, and allow you to steer the direction.
+3.  **Simulation**: The backend spawns a `Conductor` (to manage state) and multiple `SpeakerWorker` instances (one for each persona) which join the LiveKit room.
+4.  **Intervention**: Speak into the microphone to intervene. The `TranscriptionWorker` captures your speech, the `Conductor` forks the conversation state, and allows you to steer the direction.
