@@ -253,6 +253,11 @@ class Conductor:
                 reason = decision.get("reason")
                 logger.info(f"LLM Decision: {speaker_id} ({reason})")
                 
+                # RACE CONDITION CHECK 1
+                if self.is_processing_intervention:
+                    logger.info("Intervention detected after decision. Discarding decision.")
+                    continue
+                
                 if speaker_id == "silence":
                     # Broadcast Silence
                     logger.info("Loop: Silence chosen. Broadcasting silence_start...")
@@ -270,6 +275,11 @@ class Conductor:
                 # 3. Generate Text
                 persona = personas.get(speaker_id, "")
                 text = await llm.generate_turn_text(speaker_id, persona, history)
+                
+                # RACE CONDITION CHECK 2
+                if self.is_processing_intervention:
+                    logger.info("Intervention detected after generation. Discarding text.")
+                    continue
                 
                 # 4. Speak
                 self.current_speaker = speaker_id

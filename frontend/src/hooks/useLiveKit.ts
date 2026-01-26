@@ -18,6 +18,8 @@ export function useLiveKit(url: string, token: string | null) {
 
         const connect = async () => {
             try {
+                console.log("[FAC_GYM] Connecting to LiveKit URL:", url);
+                console.log("[FAC_GYM] With Token:", token?.slice(0, 10) + "...");
                 const r = new Room();
                 
                 r.on(RoomEvent.Connected, () => setIsConnected(true));
