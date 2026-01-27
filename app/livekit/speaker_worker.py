@@ -119,52 +119,71 @@ class SpeakerWorker:
         self.speak_task = asyncio.create_task(self._play_asset_routine(cmd))
 
     async def _play_asset_routine(self, cmd: PlayAssetCmdPayload):
-        """Download and play audio from URL."""
+        """Play audio from URL or local file path."""
         import httpx
         import tempfile
         import os
         
         start_time = time.time()
-        logger.info(f"Speaker {self.identity} playing asset: {cmd.audio_url[:50]}...")
+        audio_url = cmd.audio_url
+        logger.info(f"Speaker {self.identity} playing asset: {audio_url[:50]}...")
         
         try:
-            # Download audio file
-            async with httpx.AsyncClient() as client:
-                response = await client.get(cmd.audio_url)
-                if response.status_code != 200:
-                    logger.error(f"Failed to download audio: {response.status_code}")
-                    # Still send done to unblock conductor
-                    duration_ms = 0
-                    await self._send_done(duration_ms, cmd.audio_url)
-                    return
+            # Check if it's a local file path or HTTP URL
+            if audio_url.startswith(('http://', 'https://')):
+                # Download from URL
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(audio_url)
+                    if response.status_code != 200:
+                        logger.error(f"Failed to download audio: {response.status_code}")
+                        duration_ms = 0
+                        await self._send_done(duration_ms, audio_url)
+                        return
+                    
+                    audio_data = response.content
                 
-                audio_data = response.content
-            
-            # Write to temp file
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-                f.write(audio_data)
-                temp_path = f.name
-            
-            try:
-                # Play using existing _play_audio_file method
-                await self._play_audio_file(temp_path)
-            finally:
-                # Clean up temp file
+                # Write to temp file
+                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                    f.write(audio_data)
+                    temp_path = f.name
+                
                 try:
-                    os.unlink(temp_path)
-                except:
-                    pass
+                    await self._play_audio_file(temp_path)
+                finally:
+                    try:
+                        os.unlink(temp_path)
+                    except:
+                        pass
+            else:
+                # Local file path - play directly
+                if os.path.exists(audio_url):
+                    await self._play_audio_file(audio_url)
+                else:
+                    logger.error(f"Local audio file not found: {audio_url}")
+                    # Fall back to TTS if available
+                    if cmd.text:
+                        logger.info(f"Falling back to TTS for: {cmd.text[:30]}...")
+                        # Create a fake SpeakCmdPayload for TTS
+                        speak_cmd = SpeakCmdPayload(
+                            speaker_id=cmd.speaker_id,
+                            text=cmd.text
+                        )
+                        await self._speak_routine(speak_cmd)
+                        return  # _speak_routine will send done
+                    
+                    duration_ms = 0
+                    await self._send_done(duration_ms, audio_url)
+                    return
             
             duration_ms = int((time.time() - start_time) * 1000)
-            await self._send_done(duration_ms, cmd.audio_url)
+            await self._send_done(duration_ms, audio_url)
             
         except asyncio.CancelledError:
             logger.info(f"Speaker {self.identity} asset playback cancelled")
         except Exception as e:
             logger.error(f"Speaker {self.identity} asset playback error: {e}")
-            # Send done anyway to unblock conductor
             duration_ms = int((time.time() - start_time) * 1000)
-            await self._send_done(duration_ms, cmd.audio_url)
+            await self._send_done(duration_ms, audio_url)
 
     async def _speak_routine(self, cmd: SpeakCmdPayload):
         start_time = time.time()

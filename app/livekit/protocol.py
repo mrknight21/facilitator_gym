@@ -44,6 +44,9 @@ class MsgType(str, Enum):
     CLOCK_RESUME = "clock_resume"
     CLOCK_REWIND = "clock_rewind"
     TURN_PLAYBACK_TIMES = "turn_playback_times"
+    
+    # Branch Switch (after rewind/fork)
+    BRANCH_SWITCH = "branch_switch"
 
 class AgentPacket(BaseModel):
     """

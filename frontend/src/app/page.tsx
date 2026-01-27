@@ -145,6 +145,13 @@ export default function Home() {
                     const targetMs = msg.payload?.session_time_ms || 0;
                     setSessionTimeMs(targetMs);
                     clockStartRef.current = performance.now() - targetMs;
+                } else if (msg.type === 'branch_switch') {
+                    // Update branch ID when rewind creates a new branch
+                    const newBranchId = msg.payload?.branch_id;
+                    if (newBranchId) {
+                        console.log(`[FAC_GYM] Switching to branch: ${newBranchId}`);
+                        setBranchId(newBranchId);
+                    }
                 }
             } catch (e) { console.error(e); }
         };

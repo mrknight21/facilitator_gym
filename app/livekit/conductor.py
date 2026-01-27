@@ -344,6 +344,9 @@ class Conductor:
             # Update Branch ID
             self.branch_id = plan.new_branch_id
             
+            # Notify frontend of branch switch
+            await self.broadcast_branch_switch(plan.new_branch_id)
+            
             # Rewind clock to target turn end time (Ticket 7)
             # Get target turn's t_end_ms from replay_utterances[0] or from the target itself
             # The target turn is the one we are rewinding TO, so we use its end time
@@ -858,6 +861,19 @@ class Conductor:
             type=MsgType.CLOCK_REWIND,
             session_id=self.session_id,
             payload={"session_time_ms": target_ms}
+        )
+        await self.room.local_participant.publish_data(
+            msg.model_dump_json().encode("utf-8"),
+            reliable=True
+        )
+
+    async def broadcast_branch_switch(self, new_branch_id: str):
+        """Broadcast branch switch to all clients (after rewind/fork)."""
+        logger.info(f"Broadcasting BRANCH_SWITCH to branch {new_branch_id}")
+        msg = AgentPacket(
+            type=MsgType.BRANCH_SWITCH,
+            session_id=self.session_id,
+            payload={"branch_id": new_branch_id}
         )
         await self.room.local_participant.publish_data(
             msg.model_dump_json().encode("utf-8"),
