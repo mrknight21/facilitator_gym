@@ -260,6 +260,10 @@ class Conductor:
             asyncio.create_task(self.transition_to(ConductorState.ENDING))
             
         elif packet.type == MsgType.TIME_STOP:
+            # Allow TIME_STOP in LIVE, PLAYING_SEED, or REPLAYING states
+            if self.state not in [ConductorState.LIVE, ConductorState.PLAYING_SEED, ConductorState.REPLAYING]:
+                logger.warning(f"Ignoring TIME_STOP in state {self.state}")
+                return
             logger.info("Received TIME_STOP command.")
             # Pause clock (Ticket 5)
             paused_at = self.clock.pause()
@@ -267,10 +271,18 @@ class Conductor:
             asyncio.create_task(self.transition_to(ConductorState.PAUSED))
             
         elif packet.type == MsgType.REWIND_TO:
+            # Only allow REWIND_TO in PAUSED state
+            if self.state != ConductorState.PAUSED:
+                logger.warning(f"Ignoring REWIND_TO in state {self.state}")
+                return
             logger.info(f"Received REWIND_TO: {packet.payload}")
             asyncio.create_task(self._handle_rewind_to(packet.payload))
             
         elif packet.type == MsgType.REWIND_CANCEL:
+            # Only allow REWIND_CANCEL in PAUSED state
+            if self.state != ConductorState.PAUSED:
+                logger.warning(f"Ignoring REWIND_CANCEL in state {self.state}")
+                return
             logger.info("Received REWIND_CANCEL.")
             # Resume clock (Ticket 5)
             resumed_at = self.clock.resume()
@@ -284,6 +296,15 @@ class Conductor:
         if self.state == ConductorState.PLAYING_SEED:
             if self.seed_task:
                 self.seed_task.cancel()
+            await self.transition_to(ConductorState.LIVE)
+        elif self.state == ConductorState.REPLAYING:
+            # Cancel replay and go to LIVE
+            logger.info("Intervention during replay - canceling replay")
+            if self.seed_task:
+                self.seed_task.cancel()
+            # Resume clock since replay is being interrupted
+            resumed_at = self.clock.resume()
+            await self.broadcast_clock_resume(resumed_at)
             await self.transition_to(ConductorState.LIVE)
         
         # Invalidate speculation (Ticket 5)
@@ -398,21 +419,7 @@ class Conductor:
                 if replay_event_id:
                     await self.broadcast_replay_progress(replay_event_id, u.utterance_id, idx + 1, total_turns)
                 
-                # Start speculative planning on LAST replay turn (or second-to-last if handoff)
-                # so it's ready when we transition to LIVE
-                is_last_turn = (idx == total_turns - 1)
-                if is_last_turn and self.spec_planner:
-                    logger.info(f"Starting speculative planning during last replay turn (v{self.state_version})")
-                    # Build context from replay utterances
-                    replay_history = [
-                        f"{ru.speaker_id}: {ru.text}" 
-                        for ru in self.replay_plan.replay_utterances[:idx+1]
-                    ]
-                    if self.spec_plan_task:
-                        self.spec_plan_task.cancel()
-                    self.spec_plan_task = asyncio.create_task(
-                        self._run_speculative_planning(turn_id, self.state_version)
-                    )
+                # Speculative planning will start naturally when transitioning to LIVE
                 
                 await asyncio.sleep(0.5)
                 

@@ -18,7 +18,7 @@ import traceback
 from livekit import rtc
 from typing import Optional
 
-from app.livekit.protocol import AgentPacket, MsgType, SpeakCmdPayload, PlaybackDonePayload
+from app.livekit.protocol import AgentPacket, MsgType, SpeakCmdPayload, PlayAssetCmdPayload, PlaybackDonePayload
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +82,15 @@ class SpeakerWorker:
                     self.current_turn_id = packet.turn_id
                     self._handle_speak_cmd(cmd)
             
+            elif packet.type == MsgType.PLAY_ASSET_CMD:
+                # Play pre-recorded asset (for replay)
+                cmd = PlayAssetCmdPayload(**packet.payload)
+                if cmd.speaker_id == self.identity:
+                    self.session_id = packet.session_id
+                    self.current_turn_id = packet.turn_id or cmd.turn_id
+                    logger.info(f"Speaker {self.identity} received PLAY_ASSET_CMD: {cmd.audio_url}")
+                    self._handle_play_asset_cmd(cmd)
+            
             elif packet.type == MsgType.STOP_CMD:
                 self._handle_stop_cmd()
 
@@ -101,6 +110,61 @@ class SpeakerWorker:
             self.speak_task.cancel()
             # We should probably report PLAYBACK_STOPPED? 
             # For now, just stop.
+
+    def _handle_play_asset_cmd(self, cmd: PlayAssetCmdPayload):
+        """Play pre-recorded audio from URL (for replay mode)."""
+        if self.speak_task:
+            self.speak_task.cancel()
+        
+        self.speak_task = asyncio.create_task(self._play_asset_routine(cmd))
+
+    async def _play_asset_routine(self, cmd: PlayAssetCmdPayload):
+        """Download and play audio from URL."""
+        import httpx
+        import tempfile
+        import os
+        
+        start_time = time.time()
+        logger.info(f"Speaker {self.identity} playing asset: {cmd.audio_url[:50]}...")
+        
+        try:
+            # Download audio file
+            async with httpx.AsyncClient() as client:
+                response = await client.get(cmd.audio_url)
+                if response.status_code != 200:
+                    logger.error(f"Failed to download audio: {response.status_code}")
+                    # Still send done to unblock conductor
+                    duration_ms = 0
+                    await self._send_done(duration_ms, cmd.audio_url)
+                    return
+                
+                audio_data = response.content
+            
+            # Write to temp file
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                f.write(audio_data)
+                temp_path = f.name
+            
+            try:
+                # Play using existing _play_audio_file method
+                await self._play_audio_file(temp_path)
+            finally:
+                # Clean up temp file
+                try:
+                    os.unlink(temp_path)
+                except:
+                    pass
+            
+            duration_ms = int((time.time() - start_time) * 1000)
+            await self._send_done(duration_ms, cmd.audio_url)
+            
+        except asyncio.CancelledError:
+            logger.info(f"Speaker {self.identity} asset playback cancelled")
+        except Exception as e:
+            logger.error(f"Speaker {self.identity} asset playback error: {e}")
+            # Send done anyway to unblock conductor
+            duration_ms = int((time.time() - start_time) * 1000)
+            await self._send_done(duration_ms, cmd.audio_url)
 
     async def _speak_routine(self, cmd: SpeakCmdPayload):
         start_time = time.time()
