@@ -8,6 +8,7 @@ interface ControlBarProps {
     onPttDown: () => void;
     onPttUp: () => void;
     onEndSession: () => void;
+    onTimeStop: () => void;
 }
 
 export const ControlBar: React.FC<ControlBarProps> = ({
@@ -16,6 +17,7 @@ export const ControlBar: React.FC<ControlBarProps> = ({
     onPttDown,
     onPttUp,
     onEndSession,
+    onTimeStop,
 }) => {
     // Active Session Screen
     return (
@@ -28,7 +30,15 @@ export const ControlBar: React.FC<ControlBarProps> = ({
             </div>
 
             {/* Center: PTT Button */}
-            <div className="flex justify-center">
+            <div className="flex justify-center gap-4">
+                 <button
+                    onClick={onTimeStop}
+                    className="w-12 h-12 rounded-full bg-yellow-600 hover:bg-yellow-500 flex items-center justify-center text-white shadow-lg transition-all"
+                    title="Time Stop / Rewind"
+                >
+                    <Pause size={24} fill="currentColor" />
+                </button>
+
                 <button
                     onMouseDown={onPttDown}
                     onMouseUp={onPttUp}

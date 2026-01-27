@@ -26,7 +26,8 @@ class ConductorWriter:
         text: str,
         timing: Dict[str, int],
         state_snapshot: Dict[str, Any],
-        event_id: str
+        event_id: str,
+        audio_ref: Optional[Dict[str, Any]] = None
     ) -> Dict[str, str]:
         # 1. Idempotency check
         existing = await self.utterance_repo.col.find_one({"event_id": event_id})
@@ -67,7 +68,7 @@ class ConductorWriter:
             "speaker_id": speaker_id,
             "text": text,
             "timing": timing,
-            "audio": {},
+            "audio": audio_ref or {},
             "meta": {},
             "event_id": event_id,
             "created_at": now_iso

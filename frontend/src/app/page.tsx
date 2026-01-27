@@ -6,6 +6,7 @@ import { ParticipantGrid } from '@/components/ParticipantGrid';
 import { DashboardPanel } from '@/components/DashboardPanel';
 import { ControlBar } from '@/components/ControlBar';
 import { ParticipantTile } from '@/components/ParticipantTile';
+import { RewindPanel } from '@/components/RewindPanel';
 import { api } from '@/lib/api';
 import { useLiveKit } from '@/hooks/useLiveKit';
 import { RoomEvent } from 'livekit-client';
@@ -24,6 +25,16 @@ export default function Home() {
 
     // UI States
     const [isBusy, setIsBusy] = useState(false);
+    
+    // Session Clock State
+    const [sessionTimeMs, setSessionTimeMs] = useState(0);
+    const [clockPaused, setClockPaused] = useState(false);
+    const clockStartRef = useRef<number>(0);
+    const clockIntervalRef = useRef<NodeJS.Timeout | null>(null);
+    
+    // Rewind State (moved up for handleStart)
+    const [mode, setMode] = useState<'LIVE' | 'PAUSED' | 'REPLAYING'>('LIVE');
+    const [branchId, setBranchId] = useState<string | null>(null);
 
     // LiveKit Hook
     const { room, participants, isConnected } = useLiveKit(
@@ -37,6 +48,7 @@ export default function Home() {
             // 1. Start Session
             const session = await api.startSession(caseStudyId, "user");
             setSessionId(session.session_id);
+            setBranchId(session.active_branch_id);
 
             // 2. Get Token
             const tokenData = await api.getToken(session.session_id, "user");
@@ -115,6 +127,24 @@ export default function Home() {
                     // Quick UI feedback (can be improved later)
                     // alert(`System Heard: ${text}`); // Too intrusive?
                     // Let's just log it loudly for now, maybe add a transient state if we had a toast component.
+                } else if (msg.type === 'clock_sync') {
+                    // Sync session clock
+                    const syncMs = msg.payload?.session_time_ms || 0;
+                    const isPaused = msg.payload?.is_paused || false;
+                    setSessionTimeMs(syncMs);
+                    setClockPaused(isPaused);
+                    clockStartRef.current = performance.now() - syncMs;
+                } else if (msg.type === 'clock_pause') {
+                    setClockPaused(true);
+                    setSessionTimeMs(msg.payload?.session_time_ms || sessionTimeMs);
+                } else if (msg.type === 'clock_resume') {
+                    setClockPaused(false);
+                    const resumeMs = msg.payload?.session_time_ms || sessionTimeMs;
+                    clockStartRef.current = performance.now() - resumeMs;
+                } else if (msg.type === 'clock_rewind') {
+                    const targetMs = msg.payload?.session_time_ms || 0;
+                    setSessionTimeMs(targetMs);
+                    clockStartRef.current = performance.now() - targetMs;
                 }
             } catch (e) { console.error(e); }
         };
@@ -122,9 +152,40 @@ export default function Home() {
         return () => { room.off(RoomEvent.DataReceived, onData); };
     }, [room]);
 
+    // Clock tick effect - update sessionTimeMs when not paused
+    useEffect(() => {
+        if (clockPaused || !isConnected) {
+            if (clockIntervalRef.current) {
+                clearInterval(clockIntervalRef.current);
+                clockIntervalRef.current = null;
+            }
+            return;
+        }
+        
+        // Start ticking
+        clockIntervalRef.current = setInterval(() => {
+            const elapsed = performance.now() - clockStartRef.current;
+            setSessionTimeMs(Math.max(0, elapsed));
+        }, 100); // Update every 100ms for smooth display
+        
+        return () => {
+            if (clockIntervalRef.current) {
+                clearInterval(clockIntervalRef.current);
+            }
+        };
+    }, [clockPaused, isConnected]);
+
+    // Format session time as MM:SS
+    const formatTimer = (ms: number): string => {
+        const totalSeconds = Math.floor(ms / 1000);
+        const minutes = Math.floor(totalSeconds / 60);
+        const seconds = totalSeconds % 60;
+        return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+    };
+
     // Map LiveKit participants to UI model
     const uiParticipants = participants
-        .filter(p => p.identity !== "conductor-bot")
+        .filter(p => p.identity !== "conductor-bot" && p.identity !== "transcription-worker")
         .map(p => ({
             id: p.identity,
             name: p.identity, // Use identity as name for now
@@ -374,6 +435,57 @@ export default function Home() {
     }
 
 
+    // branchId is set in handleStart, no separate useEffect needed
+
+    const handleTimeStop = async () => {
+        if (!room || !sessionId) return;
+        setMode('PAUSED');
+        
+        // Send TIME_STOP
+        const encode = (msg: any) => new TextEncoder().encode(JSON.stringify(msg));
+        const msg = { type: "time_stop", session_id: sessionId };
+        try {
+            await room.localParticipant.publishData(encode(msg), { reliable: true });
+        } catch (e) { console.error("Failed to send time_stop:", e); }
+    };
+
+    const handleRewind = async (targetUtteranceId: string) => {
+        if (!room || !sessionId) return;
+        
+        // Send REWIND_TO
+        const encode = (msg: any) => new TextEncoder().encode(JSON.stringify(msg));
+        const msg = { 
+            type: "rewind_to", 
+            session_id: sessionId,
+            payload: {
+                target_utterance_id: targetUtteranceId,
+                created_by: "facilitator"
+            }
+        };
+        try {
+            await room.localParticipant.publishData(encode(msg), { reliable: true });
+            setMode('REPLAYING');
+            // Branch ID will be updated via broadcast or we can optimistically wait?
+            // Conductor broadcasts BRANCH_SWITCHED? Not yet implemented in Conductor.
+            // But Conductor changes branch.
+        } catch (e) { console.error("Failed to send rewind_to:", e); }
+    };
+
+    const handleRewindCancel = async () => {
+        if (!room || !sessionId) return;
+        setMode('LIVE');
+        
+        // Send REWIND_CANCEL
+        const encode = (msg: any) => new TextEncoder().encode(JSON.stringify(msg));
+        const msg = { type: "rewind_cancel", session_id: sessionId };
+        try {
+            await room.localParticipant.publishData(encode(msg), { reliable: true });
+        } catch (e) { console.error("Failed to send rewind_cancel:", e); }
+    };
+    
+    // Import RewindPanel
+    // We need to import it at the top.
+    
     return (
         <main className="flex h-screen flex-col bg-black overflow-hidden relative">
             {/* ... Header ... */}
@@ -381,17 +493,34 @@ export default function Home() {
                 <div className="flex items-center gap-3">
                     <div className={`w-3 h-3 rounded-full shadow-[0_0_10px] ${isConnected ? 'bg-green-500 shadow-green-500/50' : 'bg-red-500 shadow-red-500/50'}`} />
                     <h1 className="text-xl font-medium tracking-wide text-gray-200">FACILITATOR GYM</h1>
+                    {mode !== 'LIVE' && (
+                        <span className={`px-3 py-1 rounded-full text-xs font-bold ${
+                            mode === 'PAUSED' ? 'bg-yellow-500/20 text-yellow-500' : 'bg-purple-500/20 text-purple-500'
+                        }`}>
+                            {mode}
+                        </span>
+                    )}
                 </div>
                 <div className="flex items-center gap-4">
                     <div className="text-xs text-gray-400">
-                        SESSION: {sessionId}
+                        SESSION: {sessionId} {branchId && `| BRANCH: ${branchId.substring(0,8)}`}
                     </div>
 
                 </div>
             </header>
 
             {/* Main Content Area */}
-            <div className="flex-1 flex overflow-hidden">
+            <div className="flex-1 flex overflow-hidden relative">
+                {/* Rewind Panel Overlay */}
+                {mode === 'PAUSED' && sessionId && branchId && (
+                    <RewindPanel 
+                        sessionId={sessionId}
+                        branchId={branchId}
+                        onRewind={handleRewind}
+                        onCancel={handleRewindCancel}
+                    />
+                )}
+            
                 {/* Left: Participant Grid */}
                 <div className="flex-1 relative flex flex-col items-center justify-center p-8">
                     <div className="grid grid-cols-2 gap-12 w-full max-w-4xl">
@@ -423,12 +552,13 @@ export default function Home() {
 
             {/* Bottom: Control Bar */}
             <ControlBar
-                timer="00:00"
+                timer={formatTimer(sessionTimeMs)}
                 isMicOn={isMicOn}
                 onToggleMic={() => { }}
                 onPttDown={startPtt}
                 onPttUp={endPtt}
                 onEndSession={handleEndSession}
+                onTimeStop={handleTimeStop}
             />
         </main>
     );

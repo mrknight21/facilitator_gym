@@ -21,7 +21,7 @@ from app.domain.services.conductor_writer import ConductorWriter
 from app.metrics.engine import MetricsEngine
 from app.domain.services.transcript_resolver import TranscriptResolver
 from app.livekit.protocol import AgentPacket, MsgType, SpeakCmdPayload
-from app.livekit.protocol import AgentPacket, MsgType, SpeakCmdPayload
+from app.livekit.protocol import AgentPacket, MsgType, SpeakCmdPayload, PlayAssetCmdPayload
 from app.domain.services.llm_service import LLMService
 from app.livekit.speculative import SpecPlanner, SpecPlan
 
@@ -35,14 +35,26 @@ class ConductorState(str, Enum):
     INIT = "INIT"
     PLAYING_SEED = "PLAYING_SEED"
     LIVE = "LIVE"
+    PAUSED = "PAUSED"
+    REPLAYING = "REPLAYING"
     ENDING = "ENDING"
 
+from app.domain.services.rewind_service import RewindService
+
+from app.db.repos.replay_event_repo import ReplayEventRepo
+from app.livekit.session_clock import SessionClock
+
 class Conductor:
-    def __init__(self, writer: ConductorWriter, metrics_engine: MetricsEngine, resolver: TranscriptResolver):
+    def __init__(self, writer: ConductorWriter, metrics_engine: MetricsEngine, resolver: TranscriptResolver, rewind_service: RewindService, replay_event_repo: ReplayEventRepo):
         self.writer = writer
         self.metrics_engine = metrics_engine
         self.resolver = resolver
+        self.rewind_service = rewind_service
+        self.replay_event_repo = replay_event_repo
         self.room = rtc.Room()
+        
+        # Session Clock (Timekeeping Epic)
+        self.clock = SessionClock()
         
         self.state = ConductorState.INIT
         self.session_id: Optional[str] = None
@@ -89,6 +101,12 @@ class Conductor:
         await self.room.connect(url, token)
         logger.info(f"Conductor connected to room {self.room.name}")
         
+        # Start session clock
+        self.clock.start()
+        
+        # Broadcast initial clock sync to frontend
+        await self.broadcast_clock_sync()
+        
         # Initial transition
         await self.transition_to(ConductorState.PLAYING_SEED)
 
@@ -104,6 +122,16 @@ class Conductor:
             self.seed_task = asyncio.create_task(self._run_seed_playback())
         elif new_state == ConductorState.LIVE:
             self.seed_task = asyncio.create_task(self._run_live_loop())
+        elif new_state == ConductorState.PAUSED:
+            if self.seed_task: self.seed_task.cancel()
+            if self.spec_plan_task: self.spec_plan_task.cancel()
+            # Stop audio?
+            if self.current_speaker:
+                asyncio.create_task(self.send_stop_cmd(self.current_speaker))
+                
+        elif new_state == ConductorState.REPLAYING:
+            self.seed_task = asyncio.create_task(self._run_replay_loop())
+            
         elif new_state == ConductorState.ENDING:
             if self.seed_task:
                 self.seed_task.cancel()
@@ -147,6 +175,17 @@ class Conductor:
             # Start PTT
             self.is_recording_facilitator = True
             self.is_processing_intervention = True
+            
+            # Record facilitator timing (Ticket 3)
+            t_start_ms = int(self.clock.now_ms())
+            wall_start_ts = time.time()
+            self._pending_facilitator_timing = {
+                "t_start_ms": t_start_ms,
+                "wall_start_ts": wall_start_ts,
+                "sender_id": sender_id
+            }
+            logger.info(f"Facilitator PTT start at t={t_start_ms}ms")
+            
             try:
                 # Removed: self.audio_capture_buffer.clear() - Worker handles audio
                 pass
@@ -167,6 +206,15 @@ class Conductor:
             # Stop PTT & Finalize
             logger.info(f"Facilitator {sender_id} released PTT.")
             self.is_recording_facilitator = False
+            
+            # Record facilitator timing (Ticket 3)
+            if hasattr(self, '_pending_facilitator_timing') and self._pending_facilitator_timing:
+                t_end_ms = int(self.clock.now_ms())
+                wall_end_ts = time.time()
+                self._pending_facilitator_timing["t_end_ms"] = t_end_ms
+                self._pending_facilitator_timing["wall_end_ts"] = wall_end_ts
+                logger.info(f"Facilitator PTT end at t={t_end_ms}ms (duration: {t_end_ms - self._pending_facilitator_timing['t_start_ms']}ms)")
+            
             # Wait for TRANSCRIPT_COMPLETE
             
         elif packet.type == MsgType.TRANSCRIPT_COMPLETE:
@@ -182,6 +230,27 @@ class Conductor:
             # Telemetry: Log gap start
             self.t_playback_done = time.time()
             
+            # Record t_end_ms (Ticket 2)
+            t_end_ms = int(self.clock.now_ms())
+            wall_end_ts = time.time()
+            
+            # Finalize pending timing and store
+            if hasattr(self, '_pending_turn_timing') and packet.turn_id in self._pending_turn_timing:
+                timing_data = self._pending_turn_timing.pop(packet.turn_id)
+                timing_data["t_end_ms"] = t_end_ms
+                timing_data["wall_end_ts"] = wall_end_ts
+                
+                # Store for later use when committing utterance
+                if not hasattr(self, '_completed_turn_timing'):
+                    self._completed_turn_timing = {}
+                self._completed_turn_timing[packet.turn_id] = timing_data
+                
+                logger.info(f"Turn {packet.turn_id} timing: {timing_data['t_start_ms']}ms - {t_end_ms}ms")
+            
+            # Store playback metadata for commit
+            self.last_playback_duration = packet.payload.get("duration_ms", 0)
+            self.last_playback_audio_url = packet.payload.get("audio_url")
+            
             # Relay to frontend for UI update
             asyncio.create_task(self.broadcast_playback_done(sender_id))
             if self.live_loop_signal:
@@ -189,6 +258,24 @@ class Conductor:
         elif packet.type == MsgType.FINISH:
             logger.info("Received FINISH command from facilitator.")
             asyncio.create_task(self.transition_to(ConductorState.ENDING))
+            
+        elif packet.type == MsgType.TIME_STOP:
+            logger.info("Received TIME_STOP command.")
+            # Pause clock (Ticket 5)
+            paused_at = self.clock.pause()
+            asyncio.create_task(self.broadcast_clock_pause(paused_at))
+            asyncio.create_task(self.transition_to(ConductorState.PAUSED))
+            
+        elif packet.type == MsgType.REWIND_TO:
+            logger.info(f"Received REWIND_TO: {packet.payload}")
+            asyncio.create_task(self._handle_rewind_to(packet.payload))
+            
+        elif packet.type == MsgType.REWIND_CANCEL:
+            logger.info("Received REWIND_CANCEL.")
+            # Resume clock (Ticket 5)
+            resumed_at = self.clock.resume()
+            asyncio.create_task(self.broadcast_clock_resume(resumed_at))
+            asyncio.create_task(self.transition_to(ConductorState.LIVE))
 
     async def _process_intervention(self, sender_id: str):
         self.intervention_stats = {'t_fac_start': time.time(), 'sender': sender_id}
@@ -210,6 +297,146 @@ class Conductor:
                 self.live_loop_signal.set() # Force loop to wake up and re-evaluate
         
         self.intervention_stats['t_audio_stopped'] = time.time()
+
+    # -------------------------------------------------------------------------
+    # Replay Logic (Epic 3)
+    # -------------------------------------------------------------------------
+    async def _handle_rewind_to(self, payload: dict):
+        try:
+            target_utterance_id = payload.get("target_utterance_id")
+            created_by = payload.get("created_by", "user")
+            
+            if not target_utterance_id:
+                logger.error("REWIND_TO missing target_utterance_id")
+                return
+
+            logger.info(f"Planning rewind to {target_utterance_id}...")
+            
+            # Call Rewind Service
+            plan = await self.rewind_service.create_rewind_plan(
+                self.session_id, 
+                self.branch_id, 
+                target_utterance_id, 
+                created_by
+            )
+            
+            # Update Branch ID
+            self.branch_id = plan.new_branch_id
+            
+            # Rewind clock to target turn end time (Ticket 7)
+            # Get target turn's t_end_ms from replay_utterances[0] or from the target itself
+            # The target turn is the one we are rewinding TO, so we use its end time
+            target_end_ms = 0
+            if plan.replay_utterances:
+                # The first replay utterance comes AFTER the target, so we look at timing
+                # For simplicity, estimate based on position
+                # Ideally we'd have the actual t_end_ms from the target utterance
+                pass  # Clock will be set to first utterance time in replay
+            
+            self.clock.rewind_to(target_end_ms)
+            await self.broadcast_clock_rewind(target_end_ms)
+            
+            # Resume clock for replay (clock runs during playback)
+            self.clock.resume()
+            
+            # Transition to REPLAYING
+            self.replay_plan = plan
+            await self.transition_to(ConductorState.REPLAYING)
+            
+        except Exception as e:
+            logger.error(f"Rewind failed: {e}")
+            # Stay PAUSED for now so user can try again.
+
+    async def _run_replay_loop(self):
+        logger.info("Starting REPLAY loop...")
+        if not self.replay_plan:
+            logger.error("No replay plan found!")
+            await self.transition_to(ConductorState.LIVE)
+            return
+            
+        replay_event_id = getattr(self.replay_plan, "replay_event_id", None)
+        if replay_event_id:
+            await self.replay_event_repo.update_status(replay_event_id, "replaying", first_audio_start_ts=time.time())
+
+        total_turns = len(self.replay_plan.replay_utterances)
+        
+        try:
+            for idx, u in enumerate(self.replay_plan.replay_utterances):
+                if self.state != ConductorState.REPLAYING: break
+                
+                # Check for interruption
+                if self.is_processing_intervention:
+                    if replay_event_id:
+                        await self.replay_event_repo.update_status(replay_event_id, "canceled", canceled_at_turn_id=u.utterance_id)
+                    break
+                
+                self.current_speaker = u.speaker_id
+                logger.info(f"Replaying: {u.text} (Speaker: {u.speaker_id})")
+                
+                # Clear event
+                self.playback_done_event.clear()
+                
+                # Send PLAY_ASSET_CMD
+                audio_url = u.audio.url if u.audio and u.audio.url else ""
+                
+                # Generate turn_id for this replay event
+                turn_id = f"replay-{int(time.time()*1000)}"
+                self.current_turn_id = turn_id
+                
+                if audio_url:
+                    await self.send_play_asset_cmd(u.speaker_id, audio_url, u.text, turn_id)
+                else:
+                    await self.send_speak_cmd(u.speaker_id, u.text, None, turn_id)
+                
+                # Wait for PLAYBACK_DONE
+                try:
+                    await asyncio.wait_for(self.playback_done_event.wait(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout waiting for replay playback from {u.speaker_id}")
+                
+                # Broadcast Progress (Ticket 5.2)
+                if replay_event_id:
+                    await self.broadcast_replay_progress(replay_event_id, u.utterance_id, idx + 1, total_turns)
+                
+                # Start speculative planning on LAST replay turn (or second-to-last if handoff)
+                # so it's ready when we transition to LIVE
+                is_last_turn = (idx == total_turns - 1)
+                if is_last_turn and self.spec_planner:
+                    logger.info(f"Starting speculative planning during last replay turn (v{self.state_version})")
+                    # Build context from replay utterances
+                    replay_history = [
+                        f"{ru.speaker_id}: {ru.text}" 
+                        for ru in self.replay_plan.replay_utterances[:idx+1]
+                    ]
+                    if self.spec_plan_task:
+                        self.spec_plan_task.cancel()
+                    self.spec_plan_task = asyncio.create_task(
+                        self._run_speculative_planning(turn_id, self.state_version)
+                    )
+                
+                await asyncio.sleep(0.5)
+                
+            # Loop finished or interrupted
+            if self.state == ConductorState.REPLAYING:
+                if replay_event_id:
+                    await self.replay_event_repo.update_status(replay_event_id, "completed", last_audio_end_ts=time.time())
+                
+                # Check handoff reason
+                if self.replay_plan.handoff_reason == "HIT_FACILITATOR_TURN":
+                    logger.info("Replay finished (Hit Facilitator Turn). Handoff to LIVE.")
+                else:
+                    logger.info("Replay finished (End of Timeline). Handoff to LIVE.")
+                
+                # Transition to LIVE and start loop
+                await self.transition_to(ConductorState.LIVE)
+                
+        except asyncio.CancelledError:
+            logger.info("Replay loop cancelled")
+            if replay_event_id:
+                 await self.replay_event_repo.update_status(replay_event_id, "canceled")
+        except Exception as e:
+            logger.error(f"Replay loop error: {e}")
+            await self.transition_to(ConductorState.LIVE)
 
     # -------------------------------------------------------------------------
     # Seed Playback (Epic 1)
@@ -389,7 +616,15 @@ class Conductor:
                 # Update Cache (Ticket 2)
                 self.history_cache.append(f"{speaker_id}: {text}")
                 
-                await self._commit_ai_turn(speaker_id, text)
+                # Commit with audio metadata
+                audio_url = getattr(self, "last_playback_audio_url", None)
+                duration_ms = getattr(self, "last_playback_duration", 0)
+                
+                await self._commit_ai_turn(speaker_id, text, audio_url, duration_ms)
+                
+                # Reset for next turn
+                self.last_playback_audio_url = None
+                self.last_playback_duration = 0
 
                 # 7. Check Objectives
                 if await self._check_objectives(history + [f"{speaker_id}: {text}"]):
@@ -406,10 +641,17 @@ class Conductor:
                 logger.error(f"Live loop error: {e}")
                 await asyncio.sleep(2.0)
 
-    async def _commit_ai_turn(self, identity: str, text: str):
+    async def _commit_ai_turn(self, identity: str, text: str, audio_url: Optional[str] = None, duration_ms: int = 0):
         if not self.writer: return
         event_id = f"urn-ai-{int(time.time()*1000)}"
-        timing = {"t_start_ms": 0, "t_end_ms": 1000} # Stub
+        timing = {"t_start_ms": 0, "t_end_ms": duration_ms or 1000} 
+        
+        audio_ref = {}
+        if audio_url:
+            audio_ref = {
+                "url": audio_url,
+                "duration_ms": duration_ms
+            }
         
         await self.writer.append_utterance_and_checkpoint(
             self.session_id, 
@@ -419,7 +661,8 @@ class Conductor:
             text, 
             timing, 
             {}, 
-            event_id
+            event_id,
+            audio_ref=audio_ref
         )
 
     async def _run_spec_planner(self, history, personas, active_speakers, version, after_turn_id):
@@ -448,6 +691,19 @@ class Conductor:
     # Commands
     # -------------------------------------------------------------------------
     async def send_speak_cmd(self, participant_id: str, text: str, audio_url: Optional[str] = None, turn_id: Optional[str] = None):
+        # Record timing (Ticket 2)
+        t_start_ms = int(self.clock.now_ms())
+        wall_start_ts = time.time()
+        
+        # Store pending timing for this turn
+        if not hasattr(self, '_pending_turn_timing'):
+            self._pending_turn_timing = {}
+        if turn_id:
+            self._pending_turn_timing[turn_id] = {
+                "t_start_ms": t_start_ms,
+                "wall_start_ts": wall_start_ts
+            }
+        
         cmd = AgentPacket(
             type=MsgType.SPEAK_CMD,
             session_id=self.session_id,
@@ -461,7 +717,7 @@ class Conductor:
         msg_str = cmd.model_dump_json()
         
         # Broadcast to all so frontend sees it too
-        logger.info(f"Broadcasting SPEAK_CMD for {participant_id}")
+        logger.info(f"Broadcasting SPEAK_CMD for {participant_id} at t={t_start_ms}ms")
         await self.room.local_participant.publish_data(
             msg_str.encode("utf-8"), 
             reliable=True, 
@@ -493,10 +749,108 @@ class Conductor:
             destination_identities=[]
         )
 
+    async def send_play_asset_cmd(self, participant_id: str, audio_url: str, text: Optional[str] = None, turn_id: Optional[str] = None):
+        # Record timing (Ticket 2)
+        t_start_ms = int(self.clock.now_ms())
+        wall_start_ts = time.time()
+        
+        if not hasattr(self, '_pending_turn_timing'):
+            self._pending_turn_timing = {}
+        if turn_id:
+            self._pending_turn_timing[turn_id] = {
+                "t_start_ms": t_start_ms,
+                "wall_start_ts": wall_start_ts
+            }
+        
+        cmd = AgentPacket(
+            type=MsgType.PLAY_ASSET_CMD,
+            session_id=self.session_id,
+            turn_id=turn_id,
+            payload=PlayAssetCmdPayload(
+                audio_url=audio_url,
+                speaker_id=participant_id,
+                text=text,
+                turn_id=turn_id
+            ).model_dump()
+        )
+        msg_str = cmd.model_dump_json()
+        
+        logger.info(f"Broadcasting PLAY_ASSET_CMD for {participant_id} at t={t_start_ms}ms")
+        await self.room.local_participant.publish_data(
+            msg_str.encode("utf-8"), 
+            reliable=True, 
+            destination_identities=[] # Broadcast
+        )
+
     async def broadcast_silence(self):
         msg = AgentPacket(
             type="silence_start", # Custom type for frontend
             session_id=self.session_id
+        )
+        await self.room.local_participant.publish_data(
+            msg.model_dump_json().encode("utf-8"),
+            reliable=True
+        )
+
+    async def broadcast_replay_progress(self, replay_event_id: str, turn_id: str, index: int, total: int):
+        msg = AgentPacket(
+            type=MsgType.REPLAY_PROGRESS,
+            session_id=self.session_id,
+            payload={
+                "replay_event_id": replay_event_id,
+                "turn_id": turn_id,
+                "index": index,
+                "total": total
+            }
+        )
+        await self.room.local_participant.publish_data(
+            msg.model_dump_json().encode("utf-8"),
+            reliable=True
+        )
+
+    async def broadcast_clock_sync(self):
+        """Broadcast current clock state to all clients."""
+        msg = AgentPacket(
+            type=MsgType.CLOCK_SYNC,
+            session_id=self.session_id,
+            payload=self.clock.to_sync_payload()
+        )
+        await self.room.local_participant.publish_data(
+            msg.model_dump_json().encode("utf-8"),
+            reliable=True
+        )
+        logger.info(f"Broadcast CLOCK_SYNC: {self.clock.to_sync_payload()}")
+
+    async def broadcast_clock_pause(self, session_time_ms: float):
+        """Broadcast clock pause to all clients."""
+        msg = AgentPacket(
+            type=MsgType.CLOCK_PAUSE,
+            session_id=self.session_id,
+            payload={"session_time_ms": session_time_ms}
+        )
+        await self.room.local_participant.publish_data(
+            msg.model_dump_json().encode("utf-8"),
+            reliable=True
+        )
+
+    async def broadcast_clock_resume(self, session_time_ms: float):
+        """Broadcast clock resume to all clients."""
+        msg = AgentPacket(
+            type=MsgType.CLOCK_RESUME,
+            session_id=self.session_id,
+            payload={"session_time_ms": session_time_ms}
+        )
+        await self.room.local_participant.publish_data(
+            msg.model_dump_json().encode("utf-8"),
+            reliable=True
+        )
+
+    async def broadcast_clock_rewind(self, target_ms: float):
+        """Broadcast clock rewind to all clients."""
+        msg = AgentPacket(
+            type=MsgType.CLOCK_REWIND,
+            session_id=self.session_id,
+            payload={"session_time_ms": target_ms}
         )
         await self.room.local_participant.publish_data(
             msg.model_dump_json().encode("utf-8"),

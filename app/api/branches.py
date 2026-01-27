@@ -4,6 +4,8 @@ from app.domain.schemas import ForkReq, ForkRes, SetActiveBranchReq, BranchOut
 from app.domain.services.version_control import VersionControl
 from app.db.repos.branch import BranchRepo
 from app.db.repos.session import SessionRepo
+from app.db.repos.utterance import UtteranceRepo
+from app.db.repos.replay_event_repo import ReplayEventRepo
 
 router = APIRouter()
 
@@ -30,3 +32,20 @@ async def set_active_branch(session_id: str, req: SetActiveBranchReq, vc: Versio
 @router.get("/sessions/{session_id}/branches", response_model=List[BranchOut])
 async def list_branches(session_id: str, vc: VersionControl = Depends(get_vc)):
     return await vc.list_branches(session_id)
+
+
+@router.get("/sessions/{session_id}/branches/{branch_id}/materialized_timeline")
+async def get_materialized_timeline(
+    session_id: str, 
+    branch_id: str,
+    branch_repo: BranchRepo = Depends(BranchRepo),
+    utterance_repo: UtteranceRepo = Depends(UtteranceRepo),
+    replay_event_repo: ReplayEventRepo = Depends(ReplayEventRepo)
+):
+    from app.domain.services.transcript_resolver import TranscriptResolver
+    from app.domain.services.materialize_timeline import MaterializeTimelineService
+    
+    resolver = TranscriptResolver(branch_repo, utterance_repo)
+    service = MaterializeTimelineService(branch_repo, utterance_repo, replay_event_repo, resolver)
+    
+    return await service.get_materialized_timeline(session_id, branch_id)

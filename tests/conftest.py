@@ -37,6 +37,9 @@ class AsyncCollection:
     async def insert_one(self, *args, **kwargs):
         return self._col.insert_one(*args, **kwargs)
 
+    async def insert_many(self, *args, **kwargs):
+        return self._col.insert_many(*args, **kwargs)
+
     async def find_one(self, *args, **kwargs):
         return self._col.find_one(*args, **kwargs)
     

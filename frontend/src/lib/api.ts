@@ -59,5 +59,19 @@ export const api = {
         const res = await fetch(`${API_BASE}/case-studies`);
         if (!res.ok) throw new Error("Failed to get case studies");
         return res.json();
+    },
+
+    async rewindPlan(sessionId: string, branchId: string, targetUtteranceId: string, createdBy: string) {
+        const res = await fetch(`${API_BASE}/sessions/${sessionId}/rewind/plan`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                branch_id: branchId,
+                target_utterance_id: targetUtteranceId,
+                created_by: createdBy
+            })
+        });
+        if (!res.ok) throw new Error("Failed to get rewind plan");
+        return res.json();
     }
 };

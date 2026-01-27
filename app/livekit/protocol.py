@@ -6,6 +6,7 @@ class MsgType(str, Enum):
     # Conductor -> Participant
     INIT = "init"
     SPEAK_CMD = "speak_cmd"
+    PLAY_ASSET_CMD = "play_asset_cmd"
     STOP_CMD = "stop_cmd"
     
     # Participant -> Conductor
@@ -28,6 +29,21 @@ class MsgType(str, Enum):
 
     # Broadcast Silence
     SILENCE_START = "silence_start"
+    
+    # Rewind Commands (Epic 3)
+    TIME_STOP = "time_stop"
+    REWIND_TO = "rewind_to"
+    REWIND_CANCEL = "rewind_cancel"
+    
+    # Replay Progress (Epic 5)
+    REPLAY_PROGRESS = "replay_progress"
+    
+    # Clock Sync (Session Timekeeping)
+    CLOCK_SYNC = "clock_sync"
+    CLOCK_PAUSE = "clock_pause"
+    CLOCK_RESUME = "clock_resume"
+    CLOCK_REWIND = "clock_rewind"
+    TURN_PLAYBACK_TIMES = "turn_playback_times"
 
 class AgentPacket(BaseModel):
     """
@@ -45,11 +61,22 @@ class SpeakCmdPayload(BaseModel):
     speaker_id: str # The identity who should speak (useful if broadcast)
     audio_url: Optional[str] = None
 
+class PlayAssetCmdPayload(BaseModel):
+    audio_url: str
+    speaker_id: str
+    text: Optional[str] = None
+    turn_id: Optional[str] = None
+
 class PlaybackDonePayload(BaseModel):
     speaker_id: str
     duration_ms: int
     interrupted: bool = False
+    audio_url: Optional[str] = None
 
 class FacAudioPayload(BaseModel):
     # For metadata about the facilitator's speech if handled largely by backend STT
     pass
+
+class RewindToPayload(BaseModel):
+    target_utterance_id: str
+    created_by: str = "user"

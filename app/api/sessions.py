@@ -86,7 +86,16 @@ async def spawn_simulation(session_id: str, branch_id: str, room_name: str):
     writer = ConductorWriter(session_repo, branch_repo, utterance_repo, checkpoint_repo, resolver)
     metrics = MetricsEngine(metrics_repo, utterance_repo, resolver)
     
-    conductor = Conductor(writer, metrics, resolver)
+    # Rewind Support (Epic 5)
+    from app.domain.services.rewind_service import RewindService
+    from app.domain.services.version_control import VersionControl
+    from app.db.repos.replay_event_repo import ReplayEventRepo
+    
+    vc = VersionControl(branch_repo, session_repo)
+    replay_event_repo = ReplayEventRepo()
+    rewind_service = RewindService(vc, checkpoint_repo, utterance_repo, branch_repo, replay_event_repo)
+    
+    conductor = Conductor(writer, metrics, resolver, rewind_service, replay_event_repo)
     
     # 2. Connect Conductor
     token = create_token(

@@ -1,9 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException
-from app.domain.schemas import RewindReq, ContinueFromRewindReq, InterveneRes
+from app.domain.schemas import RewindReq, ContinueFromRewindReq, InterveneRes, RewindToReq, RewindPlanRes, ReplayUtteranceView
 from app.db.repos.session import SessionRepo
+from app.db.repos.utterance import UtteranceRepo
 from app.domain.services.version_control import VersionControl
+from app.domain.services.transcript_resolver import TranscriptResolver
 from app.api.branches import get_vc
 from app.db.repos.checkpoint import CheckpointRepo
+from app.db.repos.branch import BranchRepo
+from app.db.repos.replay_event_repo import ReplayEventRepo
 import uuid
 
 router = APIRouter()
@@ -59,3 +63,26 @@ async def continue_from_rewind(
         intervention_utterance_id=ckpt["at_utterance_id"], 
         checkpoint_id=ph["checkpoint_id"]
     )
+
+@router.post("/sessions/{session_id}/rewind/plan", response_model=RewindPlanRes)
+async def rewind_plan(
+    session_id: str,
+    req: RewindToReq,
+    vc: VersionControl = Depends(get_vc),
+    checkpoint_repo: CheckpointRepo = Depends(CheckpointRepo),
+    utterance_repo: UtteranceRepo = Depends(UtteranceRepo),
+    branch_repo: BranchRepo = Depends(BranchRepo),
+    replay_event_repo: ReplayEventRepo = Depends(ReplayEventRepo)
+):
+    from app.domain.services.rewind_service import RewindService
+    service = RewindService(vc, checkpoint_repo, utterance_repo, branch_repo, replay_event_repo)
+    
+    try:
+        return await service.create_rewind_plan(
+            session_id, req.branch_id, req.target_utterance_id, req.created_by
+        )
+    except ValueError as e:
+        if "Checkpoint not found" in str(e):
+             raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
+

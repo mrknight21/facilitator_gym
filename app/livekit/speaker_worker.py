@@ -106,32 +106,67 @@ class SpeakerWorker:
         start_time = time.time()
         logger.info(f"Speaker {self.identity} starting: {cmd.text[:30]}...")
         
+        # Audio collection for caching
+        collected_frames = []
+        sample_rate = 24000
+        channels = 1
+        
         try:
             # 1. Check for audio file (Pre-recorded)
             if hasattr(cmd, 'audio_url') and cmd.audio_url and os.path.exists(cmd.audio_url):
                  logger.info(f"Playing audio file: {cmd.audio_url}")
                  await self._play_audio_file(cmd.audio_url)
+                 # We don't cache what is already cached/file-based
             
             # 2. Fallback to TTS (On-the-fly)
             elif self.tts:
                 async for audio_chunk in self.tts.synthesize(cmd.text):
-                    # SynthesizedAudio wraps the actual data in 'frame' property typically, or 'data'
-                    # Based on error, audio_chunk is SynthesizedAudio.
-                    # Try accessing .frame (standard for livekit agents) or .data
+                    frame = None
                     if hasattr(audio_chunk, 'frame'):
-                        await self.audio_source.capture_frame(audio_chunk.frame)
+                        frame = audio_chunk.frame
                     elif hasattr(audio_chunk, 'data'):
-                         await self.audio_source.capture_frame(audio_chunk.data)
+                         # Assuming data is raw bytes, we might need to wrap it or just store it
+                         # For simplicity in this MVP, let's assume we get frames or can construct them
+                         # If it's raw bytes, we can't easily use capture_frame without wrapping
+                         pass 
                     else:
-                        # Fallback: maybe it IS the frame (but error says no)
-                        await self.audio_source.capture_frame(audio_chunk)
+                        frame = audio_chunk
+
+                    if frame:
+                        await self.audio_source.capture_frame(frame)
+                        # Collect for cache (assuming frame.data is the raw PCM bytes)
+                        # LiveKit AudioFrame.data is memoryview or bytes
+                        collected_frames.append(bytes(frame.data))
+
             else:
                  logger.warning("No TTS plugin available and no audio file")
                  return
             
             # Finished
             duration_ms = int((time.time() - start_time) * 1000)
-            await self._send_done(duration_ms)
+            
+            # 3. Save to Cache if we generated new audio
+            audio_url = None
+            if collected_frames and self.session_id and self.current_turn_id:
+                try:
+                    cache_dir = f"audio_cache/{self.session_id}"
+                    os.makedirs(cache_dir, exist_ok=True)
+                    filename = f"{self.current_turn_id}.wav"
+                    filepath = os.path.join(cache_dir, filename)
+                    
+                    # Write WAV
+                    with wave.open(filepath, 'wb') as wf:
+                        wf.setnchannels(channels)
+                        wf.setsampwidth(2) # 16-bit
+                        wf.setframerate(sample_rate)
+                        wf.writeframes(b''.join(collected_frames))
+                        
+                    audio_url = os.path.abspath(filepath)
+                    logger.info(f"Cached audio to {audio_url}")
+                except Exception as e:
+                    logger.error(f"Failed to cache audio: {e}")
+
+            await self._send_done(duration_ms, audio_url)
             
         except asyncio.CancelledError:
             logger.info(f"Speaker {self.identity} audio cancelled")
@@ -165,13 +200,14 @@ class SpeakerWorker:
         except Exception as e:
              logger.error(f"File playback error: {e}")
 
-    async def _send_done(self, duration_ms: int):
+    async def _send_done(self, duration_ms: int, audio_url: Optional[str] = None):
         if not self.session_id: return
         
         payload = PlaybackDonePayload(
             speaker_id=self.identity,
             duration_ms=duration_ms,
-            interrupted=False
+            interrupted=False,
+            audio_url=audio_url
         )
         msg = AgentPacket(
             type=MsgType.PLAYBACK_DONE,

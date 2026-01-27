@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional
+from enum import Enum
 from pydantic import BaseModel, Field
 
 
@@ -11,6 +12,8 @@ from pydantic import BaseModel, Field
 class Timing(BaseModel):
     t_start_ms: int = 0
     t_end_ms: int = 0
+    wall_start_ts: Optional[float] = None  # Wall-clock timestamp (for debugging)
+    wall_end_ts: Optional[float] = None
 
 
 class AudioRef(BaseModel):
@@ -111,6 +114,62 @@ class RewindReq(BaseModel):
     checkpoint_id: str
 
 
+class RewindToReq(BaseModel):
+    branch_id: str
+    target_utterance_id: str
+    created_by: str
+
+
+class UtteranceView(BaseModel):
+    utterance_id: str
+    speaker_id: Optional[str]
+    kind: UtteranceKind
+    text: str
+    timing: Timing = Field(default_factory=Timing)
+    audio: AudioRef = Field(default_factory=AudioRef)
+    display_id: str
+
+
+class ReplayUtteranceView(UtteranceView):
+    pass # Reusing UtteranceView as it has AudioRef
+
+
+class ReplayStatus(str, Enum):
+    PLANNED = "planned"
+    REPLAYING = "replaying"
+    COMPLETED = "completed"
+    CANCELED = "canceled"
+
+
+class ReplayEvent(BaseModel):
+    replay_event_id: str
+    session_id: str
+    from_branch_id: str
+    to_branch_id: str
+    target_turn_id: str
+    replayed_turn_ids: List[str]
+    handoff_at_turn_id: Optional[str] = None
+    handoff_reason: Literal["HIT_FACILITATOR_TURN", "END_OF_TIMELINE"]
+    created_at: str
+    created_by: str
+    status: ReplayStatus
+    
+    # Diagnostics
+    first_audio_start_ts: Optional[float] = None
+    last_audio_end_ts: Optional[float] = None
+    canceled_at_turn_id: Optional[str] = None
+
+
+class RewindPlanRes(BaseModel):
+    new_branch_id: str
+    fork_checkpoint_id: str
+    target_utterance_id: str
+    replay_utterances: List[ReplayUtteranceView]
+    handoff_reason: Literal["HIT_FACILITATOR_TURN", "END_OF_TIMELINE"]
+    handoff_at_utterance_id: Optional[str] = None
+    replay_event_id: str # Added for tracking
+
+
 class ContinueFromRewindReq(BaseModel):
     created_by: str
     note: Optional[str] = None
@@ -125,14 +184,6 @@ class BranchOut(BaseModel):
     created_at: Optional[str] = None
 
 
-class UtteranceView(BaseModel):
-    utterance_id: str
-    speaker_id: Optional[str]
-    kind: UtteranceKind
-    text: str
-    timing: Timing = Field(default_factory=Timing)
-    audio: AudioRef = Field(default_factory=AudioRef)
-    display_id: str
 
 
 class TranscriptViewOut(BaseModel):

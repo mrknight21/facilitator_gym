@@ -25,3 +25,10 @@ class CheckpointRepo(BaseRepo):
     async def list_by_branch(self, session_id: str, branch_id: str) -> List[Dict[str, Any]]:
         cursor = self.col.find({"session_id": session_id, "branch_id": branch_id}).sort("created_at", pymongo.ASCENDING)
         return await cursor.to_list(None)
+
+    async def get_first(self, session_id: str, branch_id: str) -> Optional[Dict[str, Any]]:
+        """Get the first (earliest) checkpoint for a branch."""
+        return await self.col.find_one(
+            {"session_id": session_id, "branch_id": branch_id},
+            sort=[("created_at", pymongo.ASCENDING)]
+        )
